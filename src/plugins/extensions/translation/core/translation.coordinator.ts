@@ -127,7 +127,29 @@ export class TranslationCoordinator {
     const settled = await Promise.allSettled(targets.map(t => this.translator.translate(text, source, t)));
     const translations: Translation[] = [];
     settled.forEach((r, i) => {
-      if (r.status === 'fulfilled') translations.push({ lang: targets[i], text: r.value });
+      if (r.status === 'fulfilled') {
+        translations.push({ lang: targets[i], text: r.value });
+      } else {
+        this.logger.warn('translate call failed', {
+          action: 'translation_translate_failed',
+          source,
+          target: targets[i],
+          error: String(r.reason),
+        });
+      }
+    });
+
+    this.logger.debug('translate decision', {
+      action: 'translation_decision',
+      author: msg.author,
+      resolvedKey: senderKey,
+      pushName: msg.pushName,
+      detected,
+      source,
+      senderLang: sender.lang,
+      knownLangs,
+      targets,
+      sent: translations.length,
     });
 
     if (translations.length > 0) {

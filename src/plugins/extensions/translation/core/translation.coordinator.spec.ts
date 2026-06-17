@@ -305,4 +305,45 @@ describe('TranslationCoordinator', () => {
     expect(mocks.warn).not.toHaveBeenCalled();
     expect(mocks.sendCombinedReply).not.toHaveBeenCalled();
   });
+
+  it('warns on a failed translate call and still delivers the successful targets', async () => {
+    const state = freshState({
+      announced: true,
+      active: true,
+      participants: {
+        's1@lid': { lang: 'en', source: 'pinned', enabled: true, samples: 5, updatedAt: 'x', pushName: 'S1' },
+        's2@lid': { lang: 'es', source: 'pinned', enabled: true, samples: 5, updatedAt: 'x', pushName: 'S2' },
+        's3@lid': { lang: 'fr', source: 'pinned', enabled: true, samples: 5, updatedAt: 'x', pushName: 'S3' },
+      },
+    });
+    const { store, gateway, translator, logger, mocks } = makeDeps(state);
+    mocks.detect.mockResolvedValue({ lang: 'en', confidence: 0.99 });
+    mocks.translate.mockImplementation((_t: string, _s: string, target: string) =>
+      target === 'fr' ? Promise.reject(new Error('boom')) : Promise.resolve('Hola'),
+    );
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, logger);
+    await c.handleMessage('s', msg({ author: 's1@lid', pushName: 'S1', body: 'Hello everyone' }));
+    expect(mocks.warn).toHaveBeenCalledWith('translate call failed', expect.objectContaining({ target: 'fr' }));
+    expect(mocks.sendCombinedReply).toHaveBeenCalledWith('s', 'g@g.us', 'M1', expect.stringContaining('Hola'));
+  });
+
+  it('emits a decision debug log for each translated message', async () => {
+    const state = freshState({
+      announced: true,
+      active: true,
+      participants: {
+        '111@c.us': { lang: 'en', source: 'pinned', enabled: true, samples: 2, updatedAt: 'x', pushName: 'D' },
+        '222@c.us': { lang: 'es', source: 'pinned', enabled: true, samples: 2, updatedAt: 'x', pushName: 'L' },
+      },
+    });
+    const { store, gateway, translator, logger, mocks } = makeDeps(state);
+    mocks.detect.mockResolvedValue({ lang: 'en', confidence: 0.99 });
+    mocks.translate.mockResolvedValue('Hola');
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, logger);
+    await c.handleMessage('s', msg({ author: '111@c.us', pushName: 'D', body: 'Hello' }));
+    expect(mocks.debug).toHaveBeenCalledWith(
+      'translate decision',
+      expect.objectContaining({ detected: 'en', source: 'en', sent: 1 }),
+    );
+  });
 });
