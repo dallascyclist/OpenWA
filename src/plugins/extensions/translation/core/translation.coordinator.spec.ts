@@ -264,4 +264,45 @@ describe('TranslationCoordinator', () => {
       expect.objectContaining({ author: 'x@lid' }),
     );
   });
+
+  it('engages the backstop instead of dropping when source != senderLang', async () => {
+    const state = freshState({
+      announced: true,
+      active: true,
+      participants: {
+        'liz@lid': { lang: 'es', source: 'pinned', enabled: true, samples: 5, updatedAt: 'x', pushName: 'Lizeth' },
+        'doug@lid': { lang: 'en', source: 'pinned', enabled: true, samples: 5, updatedAt: 'x', pushName: 'Doug' },
+      },
+    });
+    const { store, gateway, translator, logger, mocks } = makeDeps(state);
+    // Worst case: misrouted to Doug AND pushName also corrupted -> reconciliation can't help.
+    mocks.detect.mockResolvedValue({ lang: 'es', confidence: 0.99 });
+    mocks.translate.mockResolvedValue('I feel sick');
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, logger);
+    await c.handleMessage('s', msg({ author: 'doug@lid', pushName: 'Doug', body: 'Me siento mal' }));
+    expect(mocks.warn).toHaveBeenCalledWith(
+      'target backstop engaged (possible misroute or cross-language write)',
+      expect.objectContaining({ source: 'es' }),
+    );
+    expect(mocks.translate).toHaveBeenCalledWith('Me siento mal', 'es', 'en');
+    expect(mocks.sendCombinedReply).toHaveBeenCalled();
+  });
+
+  it('does not warn or translate when the group speaks only the source language', async () => {
+    const state = freshState({
+      announced: true,
+      active: true,
+      participants: {
+        'a@lid': { lang: 'en', source: 'pinned', enabled: true, samples: 5, updatedAt: 'x', pushName: 'A' },
+        'b@lid': { lang: 'en', source: 'pinned', enabled: true, samples: 5, updatedAt: 'x', pushName: 'B' },
+      },
+    });
+    const { store, gateway, translator, logger, mocks } = makeDeps(state);
+    mocks.detect.mockResolvedValue({ lang: 'en', confidence: 0.99 });
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, logger);
+    await c.handleMessage('s', msg({ author: 'a@lid', pushName: 'A', body: 'Hello there' }));
+    expect(mocks.translate).not.toHaveBeenCalled();
+    expect(mocks.warn).not.toHaveBeenCalled();
+    expect(mocks.sendCombinedReply).not.toHaveBeenCalled();
+  });
 });

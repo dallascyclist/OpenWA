@@ -99,10 +99,29 @@ export class TranslationCoordinator {
     const knownLangs = this.knownLanguages(state);
     const source = knownLangs.includes(detected) ? detected : (sender.lang ?? detected);
 
-    const targets = this.targetLanguages(state, source, sender.lang);
+    let targets = this.targetLanguages(state, source, sender.lang);
     if (targets.length === 0) {
-      await this.store.save(state);
-      return;
+      // Backstop: a real message detected in a known language must never be silently dropped due
+      // to a sender/source mismatch (e.g. a misrouted @lid author keyed to the wrong participant).
+      // Translate into every known language except the source — guarantees delivery.
+      const backstop = knownLangs.filter(l => l !== source);
+      if (backstop.length === 0) {
+        this.logger.debug('no targets; group speaks only the source language', {
+          action: 'translation_no_targets',
+          source,
+        });
+        await this.store.save(state);
+        return;
+      }
+      this.logger.warn('target backstop engaged (possible misroute or cross-language write)', {
+        action: 'translation_backstop',
+        author: msg.author,
+        pushName: msg.pushName,
+        source,
+        senderLang: sender.lang,
+        targets: backstop,
+      });
+      targets = backstop;
     }
 
     const settled = await Promise.allSettled(targets.map(t => this.translator.translate(text, source, t)));
