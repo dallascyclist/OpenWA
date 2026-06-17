@@ -1,6 +1,6 @@
 // src/modules/translation/core/translation.coordinator.spec.ts
 import { TranslationCoordinator, CoordinatorOptions } from './translation.coordinator';
-import { ChatGateway, ConfigStore, GroupState, InboundMessage, Translator } from './ports';
+import { ChatGateway, ConfigStore, GroupState, InboundMessage, Translator, TranslationLogger } from './ports';
 
 const OPTS: CoordinatorOptions = { prefix: '/tr', minLength: 2, maxLength: 2000, denyReply: false };
 
@@ -30,17 +30,35 @@ function makeDeps(state: GroupState) {
   const translate = jest.fn();
   const languages = jest.fn().mockResolvedValue(['en', 'es', 'fr']);
   const isHealthy = jest.fn().mockReturnValue(true);
+  const debug = jest.fn();
+  const info = jest.fn();
+  const warn = jest.fn();
 
   const store: ConfigStore = { load, save };
   const gateway: ChatGateway = { sendText, sendCombinedReply, getGroupAdmins };
   const translator: Translator = { detect, translate, languages, isHealthy };
+  const logger: TranslationLogger = { debug, info, warn };
 
   return {
     store,
     gateway,
     translator,
+    logger,
     saved,
-    mocks: { load, save, sendText, sendCombinedReply, getGroupAdmins, detect, translate, languages, isHealthy },
+    mocks: {
+      load,
+      save,
+      sendText,
+      sendCombinedReply,
+      getGroupAdmins,
+      detect,
+      translate,
+      languages,
+      isHealthy,
+      debug,
+      info,
+      warn,
+    },
   };
 }
 
@@ -163,5 +181,22 @@ describe('TranslationCoordinator', () => {
     await c.handleMessage('s', msg({ body: '.' }));
     expect(mocks.detect).not.toHaveBeenCalled();
     expect(mocks.sendCombinedReply).not.toHaveBeenCalled();
+  });
+
+  it('records the sender pushName on a translated message', async () => {
+    const state = freshState({
+      announced: true,
+      active: true,
+      participants: {
+        '111@c.us': { lang: 'en', source: 'pinned', enabled: true, samples: 2, updatedAt: 'x' },
+        '222@c.us': { lang: 'es', source: 'pinned', enabled: true, samples: 2, updatedAt: 'x' },
+      },
+    });
+    const { store, gateway, translator, logger, saved, mocks } = makeDeps(state);
+    mocks.detect.mockResolvedValue({ lang: 'en', confidence: 0.99 });
+    mocks.translate.mockResolvedValue('Hola');
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, logger);
+    await c.handleMessage('s', msg({ author: '111@c.us', body: 'Hello', pushName: 'Doug' }));
+    expect(saved.at(-1)?.participants['111@c.us'].pushName).toBe('Doug');
   });
 });

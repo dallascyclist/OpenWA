@@ -8,6 +8,7 @@ import {
   ParticipantState,
   Translation,
   Translator,
+  TranslationLogger,
   CommandTarget,
 } from './ports';
 import { parseCommand } from './command.parser';
@@ -21,6 +22,8 @@ export interface CoordinatorOptions {
 }
 
 const URL_OR_EMOJI_ONLY = /^(?:\s|\p{Emoji}|https?:\/\/\S+)+$/u;
+
+const NOOP_LOGGER: TranslationLogger = { debug: () => {}, info: () => {}, warn: () => {} };
 
 /**
  * Compare two WhatsApp IDs tolerantly: exact match, or same user part ignoring
@@ -40,6 +43,7 @@ export class TranslationCoordinator {
     private readonly store: ConfigStore,
     private readonly gateway: ChatGateway,
     private readonly opts: CoordinatorOptions,
+    private readonly logger: TranslationLogger = NOOP_LOGGER,
   ) {}
 
   async handleMessage(sessionId: string, msg: InboundMessage): Promise<{ swallow: boolean }> {
@@ -71,6 +75,11 @@ export class TranslationCoordinator {
     }
 
     const sender = this.ensureParticipant(state, msg.author);
+    // Record the pushName, but never overwrite a different existing value (a misrouted message
+    // could otherwise poison the identity anchor).
+    if (msg.pushName && (sender.pushName === undefined || sender.pushName === msg.pushName)) {
+      sender.pushName = msg.pushName;
+    }
     if (!sender.enabled) return;
 
     let detected: string;

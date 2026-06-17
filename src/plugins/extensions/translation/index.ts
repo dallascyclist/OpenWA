@@ -10,7 +10,7 @@ import { PluginContext, IPlugin } from '../../../core/plugins';
 import { HookContext, HookResult } from '../../../core/hooks';
 import { IncomingMessage } from '../../../engine/interfaces/whatsapp-engine.interface';
 import { TranslationCoordinator, CoordinatorOptions } from './core/translation.coordinator';
-import { InboundMessage } from './core/ports';
+import { InboundMessage, TranslationLogger } from './core/ports';
 import { LibreTranslateClient } from './libretranslate.client';
 import { PluginChatGateway } from './plugin-chat.gateway';
 import { PluginConfigStore } from './plugin-config.store';
@@ -65,7 +65,12 @@ export class TranslationPlugin implements IPlugin {
       maxLength: readNumber(cfg, 'maxLength', 2000),
       denyReply: readBool(cfg, 'denyReply', false),
     };
-    return new TranslationCoordinator(translator, store, gateway, opts);
+    const logger: TranslationLogger = {
+      debug: (m, meta) => context.logger.debug(m, meta),
+      info: (m, meta) => context.logger.log(m, meta),
+      warn: (m, meta) => context.logger.warn(m, meta),
+    };
+    return new TranslationCoordinator(translator, store, gateway, opts, logger);
   }
 
   onDisable(context: PluginContext): Promise<void> {

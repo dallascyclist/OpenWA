@@ -19,6 +19,9 @@ export interface ParticipantState {
   /** Candidate language awaiting a 2nd consecutive detection before a learned switch. */
   pendingLang?: string;
   updatedAt: string;
+  /** Last-seen WhatsApp pushName; a secondary identity anchor used to reconcile a misrouted
+   * @lid author back to the real sender. */
+  pushName?: string;
 }
 
 export type ParticipantMap = Record<string, ParticipantState>; // key = author WID
@@ -79,4 +82,14 @@ export interface ChatGateway {
   sendText(sessionId: string, chatId: string, text: string): Promise<void>;
   sendCombinedReply(sessionId: string, chatId: string, quotedMessageId: string, text: string): Promise<void>;
   getGroupAdmins(sessionId: string, chatId: string): Promise<string[]>;
+}
+
+/**
+ * Structured logging port for the translation core. Implemented at the plugin boundary over the
+ * host's PluginLogger; declared here so `core/` stays framework-agnostic.
+ */
+export interface TranslationLogger {
+  debug(message: string, meta?: Record<string, unknown>): void;
+  info(message: string, meta?: Record<string, unknown>): void;
+  warn(message: string, meta?: Record<string, unknown>): void;
 }
