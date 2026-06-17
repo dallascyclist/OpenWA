@@ -199,4 +199,69 @@ describe('TranslationCoordinator', () => {
     await c.handleMessage('s', msg({ author: '111@c.us', body: 'Hello', pushName: 'Doug' }));
     expect(saved.at(-1)?.participants['111@c.us'].pushName).toBe('Doug');
   });
+
+  it('reconciles a misrouted @lid author via a uniquely-matching pushName', async () => {
+    const state = freshState({
+      announced: true,
+      active: true,
+      participants: {
+        'liz@lid': { lang: 'es', source: 'pinned', enabled: true, samples: 5, updatedAt: 'x', pushName: 'Lizeth' },
+        'doug@lid': { lang: 'en', source: 'pinned', enabled: true, samples: 5, updatedAt: 'x', pushName: 'Doug' },
+      },
+    });
+    const { store, gateway, translator, logger, mocks } = makeDeps(state);
+    mocks.detect.mockResolvedValue({ lang: 'es', confidence: 0.99 });
+    mocks.translate.mockResolvedValue('I feel sick');
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, logger);
+    // Liz's Spanish message is misrouted to Doug's @lid, but the pushName is still Liz's.
+    await c.handleMessage('s', msg({ author: 'doug@lid', pushName: 'Lizeth', body: 'Me siento mal' }));
+    expect(mocks.translate).toHaveBeenCalledWith('Me siento mal', 'es', 'en');
+    expect(mocks.sendCombinedReply).toHaveBeenCalled();
+    expect(mocks.info).toHaveBeenCalledWith(
+      'sender reconciled by pushName',
+      expect.objectContaining({ resolvedKey: 'liz@lid' }),
+    );
+  });
+
+  it('does not reconcile when the author already owns the pushName', async () => {
+    const state = freshState({
+      announced: true,
+      active: true,
+      participants: {
+        'a@lid': { lang: 'es', source: 'pinned', enabled: true, samples: 1, updatedAt: 'x', pushName: 'Sam' },
+        'b@lid': { lang: 'en', source: 'pinned', enabled: true, samples: 1, updatedAt: 'x', pushName: 'Sam' },
+      },
+    });
+    const { store, gateway, translator, logger, mocks } = makeDeps(state);
+    mocks.detect.mockResolvedValue({ lang: 'es', confidence: 0.99 });
+    mocks.translate.mockResolvedValue('hi');
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, logger);
+    await c.handleMessage('s', msg({ author: 'a@lid', pushName: 'Sam', body: 'Hola amigo' }));
+    expect(mocks.info).not.toHaveBeenCalledWith('sender reconciled by pushName', expect.anything());
+    // a@lid (es) wrote es -> target en (attributed to the author, not reconciled to b).
+    expect(mocks.translate).toHaveBeenCalledWith('Hola amigo', 'es', 'en');
+  });
+
+  it('does not reconcile when the pushName is ambiguous across participants', async () => {
+    const state = freshState({
+      announced: true,
+      active: true,
+      participants: {
+        'x@lid': { lang: 'fr', source: 'pinned', enabled: true, samples: 1, updatedAt: 'x', pushName: 'Xavier' },
+        'a@lid': { lang: 'es', source: 'pinned', enabled: true, samples: 1, updatedAt: 'x', pushName: 'Sam' },
+        'b@lid': { lang: 'en', source: 'pinned', enabled: true, samples: 1, updatedAt: 'x', pushName: 'Sam' },
+      },
+    });
+    const { store, gateway, translator, logger, mocks } = makeDeps(state);
+    mocks.detect.mockResolvedValue({ lang: 'fr', confidence: 0.99 });
+    mocks.translate.mockResolvedValue('x');
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, logger);
+    // Author x@lid (Xavier); message pushName 'Sam' matches TWO other participants -> ambiguous.
+    await c.handleMessage('s', msg({ author: 'x@lid', pushName: 'Sam', body: 'Bonjour tout le monde' }));
+    expect(mocks.info).not.toHaveBeenCalledWith('sender reconciled by pushName', expect.anything());
+    expect(mocks.debug).toHaveBeenCalledWith(
+      'ambiguous pushName; not reconciling',
+      expect.objectContaining({ author: 'x@lid' }),
+    );
+  });
 });

@@ -74,7 +74,8 @@ export class TranslationCoordinator {
       return;
     }
 
-    const sender = this.ensureParticipant(state, msg.author);
+    const senderKey = this.resolveSenderKey(state, msg);
+    const sender = this.ensureParticipant(state, senderKey);
     // Record the pushName, but never overwrite a different existing value (a misrouted message
     // could otherwise poison the identity anchor).
     if (msg.pushName && (sender.pushName === undefined || sender.pushName === msg.pushName)) {
@@ -154,6 +155,40 @@ export class TranslationCoordinator {
       if (p.lang === null) p.lang = detected; // cold start: adopt immediately
     }
     p.updatedAt = new Date().toISOString();
+  }
+
+  /**
+   * Resolve which participant a message belongs to. whatsapp-web.js can misroute a group message's
+   * `@lid` author after a reconnect; when the message's pushName uniquely identifies a DIFFERENT
+   * known participant (and the author doesn't already own that pushName), trust the pushName.
+   * Ambiguous (shared pushName) or no-match cases fall back to the raw author.
+   */
+  private resolveSenderKey(state: GroupState, msg: InboundMessage): string {
+    const { author, pushName } = msg;
+    if (!pushName) return author;
+    // No conflict if the author already owns this pushName.
+    if (state.participants[author]?.pushName === pushName) return author;
+    const matches = Object.keys(state.participants).filter(
+      key => key !== author && state.participants[key].pushName === pushName,
+    );
+    if (matches.length === 1) {
+      this.logger.info('sender reconciled by pushName', {
+        action: 'translation_sender_reconciled',
+        author,
+        resolvedKey: matches[0],
+        pushName,
+      });
+      return matches[0];
+    }
+    if (matches.length > 1) {
+      this.logger.debug('ambiguous pushName; not reconciling', {
+        action: 'translation_pushname_ambiguous',
+        author,
+        pushName,
+        matches,
+      });
+    }
+    return author;
   }
 
   private ensureParticipant(state: GroupState, wid: string): ParticipantState {
