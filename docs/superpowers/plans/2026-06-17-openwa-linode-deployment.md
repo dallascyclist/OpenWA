@@ -76,10 +76,12 @@ EOF
 Run: `ssh root@45.33.120.227 'swapon --show && free -h | awk "/Swap/{print}"'`
 Expected: `/opt/swapfile` listed at 2G; `free` Swap total ≈ 2.4Gi (2 GB file + the pre-existing 495 MiB).
 
-- [ ] **Step 5: Create the /opt directory layout**
+- [ ] **Step 5: Create the /opt directory layout (and chown the LT model dir)**
 
-Run: `ssh root@45.33.120.227 'mkdir -p /opt/openwa/data /opt/openwa/lt-models /opt/openwa/backups /opt/etc/cron.d && ls -ld /opt/openwa /opt/openwa/data /opt/openwa/lt-models /opt/openwa/backups /opt/etc/cron.d'`
-Expected: all five directories listed.
+The LibreTranslate image runs as `uid=1032(libretranslate):gid=65534(nogroup)` and writes models under its bind mount; the dir must be owned by that uid or LT crash-loops with `PermissionError: .../argos-translate/packages`.
+
+Run: `ssh root@45.33.120.227 'mkdir -p /opt/openwa/data /opt/openwa/lt-models /opt/openwa/backups /opt/etc/cron.d && chown -R 1032:65534 /opt/openwa/lt-models && ls -ld /opt/openwa /opt/openwa/data /opt/openwa/lt-models /opt/openwa/backups /opt/etc/cron.d'`
+Expected: all five directories listed; `lt-models` owned by `1032 65534`.
 
 ---
 
@@ -414,3 +416,19 @@ Summarize: services up, dashboard reachable from the dev IP only, session connec
 **Placeholder scan:** none — every step has exact commands/file contents. The smoke-test key in Task 3 is an explicit temporary value, replaced in Task 4.
 
 **Consistency:** service set (`dashboard`, `docker-proxy`, `libretranslate`, `openwa-api`) is identical across Tasks 3/5/6; the `openwa-data` bind device (`/opt/openwa/data`), LT model path (`/home/libretranslate/.local/share/argos-translate`), languages (`en,es,ru,zh-Hans`), branch (`feat/whatsapp-translation-plugin`), and ports (`2886` dev-facing, `2785` internal) match the spec throughout. Cutover order (stop laptop → tar → migrate → up) is enforced by Task 4 preceding Task 5.
+
+---
+
+## Execution notes — fixes applied during the real deployment (2026-06-17, COMPLETE & reboot-verified)
+
+The plan above was executed inline; these issues surfaced and were fixed. Fold them into the plan for any redo:
+
+1. **LibreTranslate model dir ownership** (Task 1/3): the `libretranslate/libretranslate` image runs as `uid=1032(libretranslate):gid=65534(nogroup)`; the `/opt/openwa/lt-models` bind mount must be `chown -R 1032:65534` or LT crash-loops with `PermissionError: …/argos-translate/packages`. (Now in Task 1 Step 5.)
+2. **`AUTO_START_SESSIONS` not in the repo compose** (Task 5): the compose env list doesn't include it, so authenticated sessions don't auto-relaunch on boot. Added `AUTO_START_SESSIONS=true` to the `openwa-api` service in `docker-compose.override.yml` (required for reboot survival).
+3. **Session stalled at `authenticating`** (Task 5): whatsapp-web.js auto-selected an incompatible WA-Web version. Fixed by `WWEBJS_WEB_VERSION=2.3000.1023204257` in `/opt/openwa/.env` (the compose already passes this var). Session then resumed the migrated LocalAuth **without a QR re-scan**.
+4. **Config `PUT` body shape** (Task 5): the endpoint expects `{"config":{...}}` (wrapped), not the bare object — unwrapped returns 400.
+5. **Extension-plugin enable-state is NOT persisted** (Task 5/6): `translation` registers DISABLED every boot (no `registry.json` for built-in/extension plugins; not a write failure). Added a systemd oneshot **`owa-plugin-config.service`** (`/opt/openwa/enable-plugin.sh`, canonical unit in `/opt/etc/systemd/system/`, symlinked into `/etc`) that waits for `/api/health/ready` then POSTs enable + PUTs the LibreTranslate config on every boot. Required for reboot survival.
+6. **`ufw` does NOT filter Docker-published ports** (Task 2/5): Docker's FORWARD/DNAT rules run before the `ufw` chains (ufw forward chains saw 0 packets), so the `ufw allow 2886` rule is cosmetic for the dashboard. Host-level enforcement is a **`DOCKER-USER`** rule instead — `/opt/openwa/docker-fw.sh` applied via systemd oneshot **`owa-docker-fw.service`**. The rule MUST match only NEW, original-direction connections (`--ctstate NEW`) or it also drops the container's REPLY packets (which carry the same `ctorigdstport 2886`), causing client timeouts. Allowlist matches the operator's Linode cloud-FW profile `open508`: `47.190.78.199/32` + `45.248.25.5/32`.
+7. **macOS `tar` AppleDouble** (Task 4): `tar -czf` on macOS embeds `._*` xattr sidecars; `find /opt/openwa/data -name '._*' -delete` after extraction (or `COPYFILE_DISABLE=1 tar …` on the laptop).
+
+**Final validated state:** all 4 services `running`; session `ready` (`14697748333`, migrated, no QR); plugin `enabled` + `libretranslateUrl=http://libretranslate:5000`; live English→target translation confirmed in-group; dashboard reachable from the dev IPs (`200`), world blocked at the host; **full VM reboot self-recovers the entire stack** (session ready + plugin enabled + firewall + dashboard) with no manual steps. Memory ~700 MiB of 3.8 GiB. Nightly data backup via cron. Linode cloud FW (`open508`) is the operator's edge layer (toggle in the Linode UI); the host `DOCKER-USER` rule is the second layer.
