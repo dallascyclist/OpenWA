@@ -34,7 +34,7 @@ Single `docker compose` stack, all services `restart: unless-stopped`, on the re
 - **`dashboard`** — repo `with-dashboard` profile, built from `dashboard/Dockerfile` (the **standalone** nginx variant, which proxies `/api` + `/socket.io` to the backend itself; the repo's separate `dashboard/Dockerfile.traefik` is the traefik-fronted variant we are *not* using). ~50 MB. Used for login, QR scan, plugin/session management. Host-published on the firewalled port.
 - **`libretranslate`** (new service, not in the repo compose) — `libretranslate/libretranslate`, `LT_LOAD_ONLY=en,es,ru,zh-Hans`, models on a persistent bind mount. Reached internally at `http://libretranslate:5000`.
 
-**Excluded** (unneeded for SQLite + local single-session): `postgres`, `redis`, `minio` (their profiles simply aren't activated); `traefik` and `docker-proxy` (excluded via the override by gating them behind an unused profile, since they are otherwise core/auto-start). For `openwa-api`, leave `DOCKER_HOST` unset so it never tries to reach the absent docker-proxy (the Infrastructure/self-orchestration page is intentionally non-functional). **No Caddy/TLS layer** (accepted risk: single BGP hop to Linode, provider owns the hardware, personal time-boxed project).
+**Not activated** (unneeded for SQLite + local single-session): `traefik`, `postgres`, `redis`, `minio` — their profiles simply aren't passed to `docker compose`. **`docker-proxy` is kept** (it's a core/auto-start service that `openwa-api` hard-`depends_on`; ~20 MB, socket mounted read-only on an isolated internal network per the repo's hardening) — fighting that dependency is more fragile than keeping the tiny proxy; the Infrastructure page is simply unused. The dashboard is built from the standalone `dashboard/Dockerfile` (its `nginx.conf` proxies `/api/` + `/socket.io/` to `openwa-api:2785`), so **only port `2886` is published** dev-facing; `openwa-api` stays on its localhost-only `2785` bind and is reached either over the compose network or via the dashboard's `/api` proxy. **No Caddy/TLS layer** (accepted risk: single BGP hop to Linode, provider owns the hardware, personal time-boxed project).
 
 The repo `docker-compose.yml` is **not modified**; a local **`docker-compose.override.yml`** adds `libretranslate`, repoints the `openwa-data` volume to a `/opt` bind mount, and selects the `with-dashboard` profile.
 
@@ -65,7 +65,7 @@ Docker's data-root stays default (`/var/lib/docker`, same disk) unless we choose
 
 ## Networking & security
 
-- **Linode Cloud Firewall + host `ufw`**, both: inbound allowed only from `47.190.78.199/32`, only on `22` (SSH), `2785` (API), `2886` (dashboard); default-deny all other inbound. Egress open (WhatsApp Web, image pulls, model downloads, webhooks).
+- **Linode Cloud Firewall + host `ufw`**, both: inbound allowed only from `47.190.78.199/32`, only on `22` (SSH) and `2886` (dashboard, which also proxies `/api`); default-deny all other inbound. (`2785` is not published dev-facing; reach the API via `…:2886/api/...`.) Egress open (WhatsApp Web, image pulls, model downloads, webhooks). `ufw` is the enforced layer; the Linode Cloud Firewall is documented as a manual UI step (defense-in-depth).
 - `API_MASTER_KEY` set in `/opt/openwa/.env` (migrated from `data/.api-key`) as defense-in-depth behind the allowlist.
 - No TLS (accepted): API key + dashboard login + message content cross the internet in cleartext between the allowed IP and the VM.
 
@@ -76,7 +76,7 @@ Docker's data-root stays default (`/var/lib/docker`, same disk) unless we choose
 
 ## Validation (done-criteria)
 
-- From `47.190.78.199`: dashboard loads at `http://45.33.120.227:2886`, API `…:2785/api/docs` → 200; from any other IP: refused.
+- From `47.190.78.199`: dashboard loads at `http://45.33.120.227:2886`, API via `…:2886/api/docs` → 200; from any other IP: refused.
 - Session shows connected (resumed or re-scanned); a Spanish/Russian/Chinese test message round-trips a translation (LibreTranslate reachable at `libretranslate:5000`).
 - `docker compose restart` and a full VM `reboot` both bring the stack back automatically.
 - `free -h` shows headroom (~1+ GB free) under active translation.
