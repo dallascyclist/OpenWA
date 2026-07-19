@@ -104,6 +104,9 @@ export class TranslationPlugin implements IPlugin {
       context.logger.error('Translation hook failed', error, {
         sessionId: ctx.sessionId,
         action: 'translation_hook_error',
+        chatId: msg.chatId,
+        author: msg.author,
+        errorType: error instanceof Error ? error.name : typeof error,
       });
       return { continue: true };
     }
