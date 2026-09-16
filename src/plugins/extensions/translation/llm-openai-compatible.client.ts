@@ -29,7 +29,10 @@ export const SYSTEM_PROMPT = [
   'Output ONLY a JSON object of the form {"source":"<code>","translations":{"<code>":"<translated text>"}} with one entry for every code in "candidateLangs" except "source". If "candidateLangs" is empty, "translations" is {}.',
 ].join('\n');
 
-/** Generous ISO 639-1 list; an LLM is not limited to LibreTranslate's installed models. */
+/**
+ * Generous ISO 639-1 list (plus the script-tagged Chinese codes LibreTranslate emits); an LLM is not
+ * limited to LibreTranslate's installed models.
+ */
 const LLM_LANGUAGES = [
   'af',
   'ar',
@@ -105,7 +108,15 @@ const LLM_LANGUAGES = [
   'uz',
   'vi',
   'zh',
+  'zh-Hans',
+  'zh-Hant',
 ];
+
+/**
+ * A language code, not prose. Accepts BCP-47 script/region subtags because LibreTranslate emits
+ * `zh-Hans`, so that code reaches us through `candidateLangs` and comes back as `source`.
+ */
+const LANG_CODE_RE = /^[a-z]{2,3}(-[a-z0-9]{2,8})*$/i;
 
 const REFUSAL_RE = /\b(i can(?:no|')t|i'?m sorry|i am sorry|i (?:am )?unable to|i won'?t)\b/i;
 
@@ -179,7 +190,7 @@ export class OpenAiCompatibleClient implements ContextualTranslator, ModelSwitch
 
     const parsed = parseModelJson(content);
     const source = parsed.source;
-    if (typeof source !== 'string' || !/^[a-z]{2,3}$/.test(source)) {
+    if (typeof source !== 'string' || !LANG_CODE_RE.test(source)) {
       throw new Error(`LLM returned invalid source: ${String(source)}`);
     }
     const map = parsed.translations;
@@ -188,7 +199,7 @@ export class OpenAiCompatibleClient implements ContextualTranslator, ModelSwitch
     const translations: Translation[] = [];
     for (const lang of req.candidateLangs) {
       if (lang === source) continue;
-      const text = (map as Record<string, unknown>)[lang];
+      const text = pickTranslation(map as Record<string, unknown>, lang);
       if (typeof text !== 'string' || text.trim().length === 0) {
         throw new ProviderRefusedError(`missing translation for ${lang}`);
       }
@@ -244,7 +255,21 @@ function userPayload(req: TranslateRequest): Omit<TranslateRequest, 'allowExtern
   return rest;
 }
 
-/** Parse the model's JSON, tolerating fences/prose. Refusal prose throws ProviderRefusedError. */
+/**
+ * Look up one target's text. Exact match is the primary path; a case-insensitive key match is the
+ * fallback, so a model that echoes `zh-hans` for a `zh-Hans` target is not mistaken for a refusal.
+ */
+function pickTranslation(map: Record<string, unknown>, lang: string): unknown {
+  if (lang in map) return map[lang];
+  const lower = lang.toLowerCase();
+  const key = Object.keys(map).find(k => k.toLowerCase() === lower);
+  return key === undefined ? undefined : map[key];
+}
+
+/**
+ * Parse the model's JSON, tolerating code fences or prose around it by retrying on the span from the
+ * first `{` to the last `}`. Refusal prose throws ProviderRefusedError.
+ */
 export function parseModelJson(content: string): { source: unknown; translations: unknown } {
   const attempt = (s: string): unknown => {
     try {

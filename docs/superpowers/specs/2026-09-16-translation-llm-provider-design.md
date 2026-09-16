@@ -206,7 +206,11 @@ Response validation (any failure throws, which the chain treats as a provider fa
 - HTTP 2xx; `choices[0].message.content` present.
 - Content parses as JSON (tolerate leading/trailing prose or code fences by extracting the first balanced
   `{...}`; some providers ignore `response_format`).
-- `source` is a 2-3 letter lowercase string.
+- `source` is a language code, not prose: a 2-3 letter base code, optionally followed by BCP-47
+  script/region subtags and matched case-insensitively (`/^[a-z]{2,3}(-[a-z0-9]{2,8})*$/i`). Subtags are
+  accepted because LibreTranslate emits codes like `zh-Hans`, which therefore reach the model in
+  `candidateLangs` and come back as `source`; rejecting them would silently exclude Chinese-authored
+  messages from the LLM path. The check still rejects prose such as `"Spanish"`.
 - `translations` is an object containing **every** required target (`candidateLangs` minus `source`) with a
   non-empty string. A missing target is treated as a refusal, since that is how refusals surface in practice.
 - Content that matches common refusal phrasing where JSON was expected (e.g. "I can't", "I'm sorry") throws

@@ -115,6 +115,33 @@ describe('OpenAiCompatibleClient', () => {
     await expect(client().translateAll(req())).rejects.toThrow(/invalid source/);
   });
 
+  it('accepts a BCP-47 source with a script subtag (LibreTranslate emits zh-Hans)', async () => {
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue(completion('{"source":"zh-Hans","translations":{"en":"hi","ru":"x"}}')) as never;
+    const out = await client().translateAll(req({ candidateLangs: ['en', 'zh-Hans', 'ru'], hintLang: 'zh-Hans' }));
+    expect(out).toEqual({
+      detected: 'zh-Hans',
+      source: 'zh-Hans',
+      translations: [
+        { lang: 'en', text: 'hi' },
+        { lang: 'ru', text: 'x' },
+      ],
+      provider: 'llm',
+    });
+  });
+
+  it('matches a target key case-insensitively rather than calling it a refusal', async () => {
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue(completion('{"source":"es","translations":{"en":"hi","zh-hans":"你好"}}')) as never;
+    const out = await client().translateAll(req({ candidateLangs: ['en', 'es', 'zh-Hans'] }));
+    expect(out.translations).toEqual([
+      { lang: 'en', text: 'hi' },
+      { lang: 'zh-Hans', text: '你好' },
+    ]);
+  });
+
   it('returns empty translations when candidateLangs is empty', async () => {
     global.fetch = jest.fn().mockResolvedValue(completion('{"source":"de","translations":{}}')) as never;
     const out = await client().translateAll(req({ candidateLangs: [], hintLang: null }));
@@ -126,7 +153,9 @@ describe('OpenAiCompatibleClient', () => {
       (_u: string, init?: RequestInit) =>
         new Promise((_res, rej) => init?.signal?.addEventListener('abort', () => rej(new Error('aborted')))),
     ) as never;
-    await expect(client({ timeoutMs: 10 }).translateAll(req())).rejects.toThrow('aborted');
+    const c = client({ timeoutMs: 10, failureThreshold: 1 });
+    await expect(c.translateAll(req())).rejects.toThrow('aborted');
+    expect(c.isHealthy()).toBe(false);
   });
 
   it('opens the circuit after N transport failures, throws fast while open, and reports unhealthy', async () => {
@@ -208,7 +237,7 @@ describe('parseModelJson', () => {
   it('parses clean JSON', () => {
     expect(parseModelJson('{"source":"en","translations":{}}')).toEqual({ source: 'en', translations: {} });
   });
-  it('extracts the first balanced object from surrounding text', () => {
+  it('extracts the span from the first { to the last } in surrounding text', () => {
     expect(parseModelJson('Here: {"source":"en","translations":{"es":"x"}} done')).toEqual({
       source: 'en',
       translations: { es: 'x' },
