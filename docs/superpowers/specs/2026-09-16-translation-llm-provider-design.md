@@ -50,7 +50,8 @@ Non-goals (explicitly deferred):
 | D5 | **Fallback chain**: LLM then LibreTranslate; refusals count as failures | Guarantees delivery. Adult content that a stricter provider refuses still gets a (worse) translation rather than nothing. |
 | D6 | **No per-reply provider tag**; one-time degraded/recovered notice per group + `/tr status` | Doug's call: tagging every reply is noise. |
 | D7 | **Privacy**: instance default (`defaultPrivacy`) + per-group override via `/tr privacy` | Doug's VM runs cloud-by-default; a commercial tenant can ship local-by-default. Costs almost nothing extra. |
-| D8 | Default model `grok-4.20-0309-non-reasoning` | Cheapest general-purpose Grok text tier as of 2026-09-16 (USD 1.25 in / 2.50 out per 1M tokens, same as grok-4.3); non-reasoning avoids reasoning latency on a task that does not need it. Configurable. |
+| D8 | Initial model `grok-4.20-0309-non-reasoning` | Cheapest general-purpose Grok text tier as of 2026-09-16 (USD 1.25 in / 2.50 out per 1M tokens, same as grok-4.3); non-reasoning avoids reasoning latency on a task that does not need it. Only the *initial* value; see D11. |
+| D11 | Model is **runtime-selectable in chat** (`/tr model list` / `/tr model switch`), not a dashboard config key; gated by an **operator allow-list** of WhatsApp IDs | Doug wants to experiment across models without a config round-trip. Instance-wide (one active model for all groups) because this is an experimentation control, not a per-tenant feature. Persisted in plugin storage so a container restart does not revert it. |
 | D9 | `llmEnabled` defaults **false** | The VM must keep working through a deploy until the API key is provisioned. |
 | D10 | Ignored participants' messages still enter the context buffer | They are still part of the conversation the LLM needs to understand; "ignore" means "don't translate their messages", not "pretend they aren't there". |
 
@@ -64,12 +65,14 @@ translation/
     ports.ts                     (changed) + ContextualTranslator, TranslateRequest/Result, ContextTurn,
                                  SummaryProvider (reserved), GroupState privacy fields, ProviderHealthListener
     translation.coordinator.ts   (changed) uses ContextualTranslator; privacy cmd; disclosure; degraded notices
-    command.parser.ts            (changed) + `privacy [cloud|local]`
-    reply.formatter.ts           (changed) status shows providers + privacy; disclosure text; notice text
+    command.parser.ts            (changed) + `privacy [cloud|local]`, `model [list|switch <id>]`
+    reply.formatter.ts           (changed) status shows providers, privacy, model; disclosure; notice; model list
     fallback-chain.ts            (new)  ordered providers, external-skip, circuit-aware, health transitions
     conversation-context.ts      (new)  per-chat ring buffer with turn + char caps
     libretranslate.contextual.ts (new)  wraps the existing Translator (detect + fan-out) behind the new port
-  llm-openai-compatible.client.ts (new) Grok/OpenAI-compatible adapter: prompt, request, validation, breaker
+  llm-openai-compatible.client.ts (new) Grok/OpenAI-compatible adapter: prompt, request, validation, breaker,
+                                 ModelSwitchable (list via /models or xAI /language-models, set at runtime)
+  core/model-store.ts            (new)  load/save the active model id via ConfigStore-style storage port
   libretranslate.client.ts       (unchanged)
   index.ts                       (changed) wires chain = [llm?, libretranslate]; reads new config keys
   plugin-chat.gateway.ts         (unchanged)
@@ -124,6 +127,19 @@ export interface ContextualTranslator {
 /** Reserved (D4). Not implemented or wired in this cut. */
 export interface SummaryProvider {
   summarize(turns: ContextTurn[], previousSummary?: string): Promise<string>;
+}
+
+export interface ModelInfo {
+  id: string;
+  inputPerMTok?: number;   // USD per 1M input tokens, when the provider exposes pricing
+  outputPerMTok?: number;  // USD per 1M output tokens
+}
+
+/** Implemented by providers whose model can be changed at runtime (the LLM adapter). */
+export interface ModelSwitchable {
+  listModels(): Promise<ModelInfo[]>;
+  currentModel(): string;
+  setModel(id: string): void;
 }
 
 export interface ProviderHealth { name: string; healthy: boolean }
@@ -192,6 +208,16 @@ Response validation (any failure throws, which the chain treats as a provider fa
 validation does not become stricter than before. The chain prefers LibreTranslate's live list when
 LibreTranslate is healthy (see section 8), so today's behaviour is preserved.
 
+Model switching (`ModelSwitchable`):
+- `currentModel()` / `setModel(id)`: the adapter holds the active model id in memory; every request uses it.
+  `setModel` does not validate against the catalog (a provider may accept ids it does not list); the
+  coordinator validates before calling it (section 11a).
+- `listModels()`: `GET {baseUrl}/models` (OpenAI shape, `data[].id`). When `baseUrl` host is `api.x.ai`, use
+  `GET {baseUrl}/language-models` instead, which also returns per-token pricing; map its price fields to USD
+  per 1M tokens (xAI prices are quoted in fractions of a cent per token; the implementer must confirm the
+  unit against the live response and document the conversion in code). Any provider that returns no pricing
+  yields `ModelInfo` without price fields. Cached for 10 minutes to keep `/tr model list` cheap.
+
 ## 8. Fallback chain (core/fallback-chain.ts)
 
 `new FallbackChain(providers: ContextualTranslator[], onHealth?: ProviderHealthListener)`
@@ -251,9 +277,36 @@ What never enters: commands, the bot's own sends, messages below `minLength`, UR
 - Notice text: degraded "⚠️ AI translation is temporarily unavailable; using basic translation until it
   recovers." recovered "✅ AI translation is back." LibreTranslate transitions get the analogous text
   ("basic translator"). No notice for external providers in a local-only group.
-- `/tr status` adds one line per provider: `AI translator (grok): ok | degraded | disabled | off (privacy)`
+- `/tr status` adds one line per provider: `AI translator (grok-4.20-0309-non-reasoning): ok | degraded | disabled | off (privacy)`
   and `Basic translator (libretranslate): ok | unreachable`, plus `Privacy: cloud (instance default)` or
   `local (group override)`.
+
+## 11a. Runtime model selection (`/tr model`)
+
+Commands (all gated by the operator allow-list, section 12 `operatorWids`; admins/delegates are **not**
+sufficient, this is an instance-level control):
+- `/tr model` — show the active model id and the provider base URL host.
+- `/tr model list` — call `listModels()` and post one line per model: `id`, then `in $X / out $Y per 1M tok`
+  when pricing is available, with the active model marked. Truncate to the first 30 entries with a
+  "(+N more)" trailer so a large OpenAI catalog cannot flood the group.
+- `/tr model switch <id>` — validate `<id>` against `listModels()` (case-sensitive exact match); on hit call
+  `setModel(id)`, persist via `ModelStore`, and confirm. On miss reply with the nearest few ids (simple
+  prefix/substring match) and do nothing. If the catalog call fails, allow the switch anyway with a
+  "catalog unavailable, switched unverified" confirmation, since the next translation will reveal a bad id
+  through the normal fallback path.
+
+Non-operators running any `/tr model` form get the same `denyReply` treatment as other restricted commands
+(silent unless `denyReply` is true).
+
+Persistence (`core/model-store.ts`): a single storage key (`llm:model`) holding `{ model: string,
+updatedAt: string, updatedBy: string }` through the same `ctx.storage` the group state uses. On plugin
+enable/config-change, `index.ts` loads it and, if present, overrides the initial `llmModel` before
+constructing the adapter. This is what makes the switch survive the VM's post-restart config re-PUT.
+
+Operator identity: `msg.author` is compared to each `operatorWids` entry with the coordinator's existing
+`widEquals` (tolerant of `:device` suffixes and `@domain`). Because the host may deliver Doug's messages
+under an `@lid` id rather than `<phone>@c.us`, the list accepts multiple entries; Doug adds both forms once
+known. `/tr status` shows the active model so an operator can confirm a switch took effect.
 
 ## 12. Configuration keys (plugin config, alongside existing keys)
 
@@ -262,7 +315,8 @@ What never enters: commands, the bot's own sends, messages below `minLength`, UR
 | `llmEnabled` | boolean | `false` | Chain includes the LLM only when true **and** `llmApiKey` set |
 | `llmBaseUrl` | string | `https://api.x.ai/v1` | Any OpenAI-compatible base; no trailing slash |
 | `llmApiKey` | string (secret) | — | Same handling as `libretranslateApiKey` |
-| `llmModel` | string | `grok-4.20-0309-non-reasoning` | D8 |
+| `llmModel` | string | `grok-4.20-0309-non-reasoning` | **Initial** model only (D8). A persisted `/tr model switch` choice overrides it (D11). |
+| `operatorWids` | string[] | `[]` | WhatsApp IDs allowed to run `/tr model *`. Doug's ID on the VM. Empty list means nobody can switch models. |
 | `llmTimeoutMs` | number | `8000` | Hook bus has no per-handler timeout (verified 2026-09-16) |
 | `contextTurns` | number | `10` | Ring buffer size |
 | `defaultPrivacy` | `'cloud'|'local'` | `'cloud'` | Instance default (D7) |
@@ -288,10 +342,15 @@ Unit (Jest, colocated `*.spec.ts`, fakes only, no network):
 - `fallback-chain.spec.ts`: skips external when `allowExternal=false`; skips unhealthy; falls through on
   throw; `AllProvidersFailedError` when all fail; health transitions deduped.
 - `conversation-context.spec.ts`: ordering, turn cap, char cap, clear, key isolation.
+- `model-store.spec.ts`: round-trip, absent key yields null.
+- LLM client spec additions: `listModels` parses the OpenAI `/models` shape and the xAI `/language-models`
+  shape with prices; catalog cached; `setModel` changes the model on the next request body.
 - `libretranslate.contextual.spec.ts`: detect + fan-out mapping; partial failure yields partial result.
 - `translation.coordinator.spec.ts` (extend): request assembly (candidates, glossary, history excludes
   current message); privacy local forces `allowExternal=false`; disclosure posted exactly once on `on`
   and on switch to cloud; `/tr privacy` output; degraded notice once per transition, none in local groups;
+  `/tr model list|switch` allowed for an `operatorWids` entry (including `:device`-suffixed author) and
+  denied for a group admin who is not an operator; switch persists via the store and unknown id is rejected;
   context cleared on `off`; ignored participant's message enters context but is not translated.
 - `command.parser.spec.ts`, `reply.formatter.spec.ts` (extend).
 - All existing specs remain green; coverage thresholds unchanged.
@@ -303,7 +362,8 @@ an explicit-content sample to the configured provider and prints the parsed resu
 
 1. Put the xAI key in `/opt/openwa/secrets/xai.key` (root-only, `chmod 600`).
 2. Extend `/opt/openwa/enable-plugin.sh` config PUT to include `llmEnabled`, `llmBaseUrl`, `llmModel`,
-   `llmApiKey` (read from the file), `contextTurns`, `defaultPrivacy`. This script is the source of truth for
+   `llmApiKey` (read from the file), `contextTurns`, `defaultPrivacy`, `operatorWids` (Doug's WhatsApp ID,
+   both `<phone>@c.us` and the `@lid` form once observed in logs). This script is the source of truth for
    plugin config after every container restart (extension plugin state is not persisted).
 3. Rebuild/redeploy the `openwa-api` image from the branch, `docker compose --profile with-dashboard up -d`,
    then `systemctl restart owa-plugin-config`.
@@ -330,6 +390,6 @@ Update `CLAUDE.md` "Managing the VM stack" with the new secret file and config k
 - Rolling summary via `SummaryProvider`: when the buffer overflows, summarize the dropped turns into
   `summary`, carry it forward, include it in the request. Adds one LLM call per overflow, not per message.
 - Anthropic adapter behind the same `ContextualTranslator` port.
-- Per-group model or provider override (commercial tiering).
+- Per-group model or provider override (commercial tiering); today's `/tr model switch` is instance-wide.
 - Idle-chat eviction for `ConversationContext`.
 - Persisting the disclosure/privacy policy version so a changed policy re-discloses.
