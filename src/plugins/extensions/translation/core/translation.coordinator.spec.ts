@@ -365,6 +365,60 @@ describe('TranslationCoordinator', () => {
     );
   });
 
+  it('keeps every target on the message that confirms a learned-language switch', async () => {
+    // Regression: on the flip message the sender's pending language is not yet in `knownLanguages`,
+    // so without augmenting the provider request the wrapper translates FROM the stale hint and
+    // never produces the other English speaker's copy, which `targetLanguages` still demands.
+    const state = freshState({
+      announced: true,
+      active: true,
+      participants: {
+        '111@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 5, updatedAt: 'x' },
+        '222@c.us': { lang: 'es', source: 'learned', enabled: true, samples: 5, updatedAt: 'x' },
+        '333@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 5, updatedAt: 'x' },
+      },
+    });
+    const { store, gateway, translator, extras, mocks } = makeDeps(state);
+    mocks.detect.mockResolvedValue({ lang: 'fr', confidence: 0.99 });
+    mocks.translate.mockImplementation((_text: string, src: string, tgt: string) => Promise.resolve(`${src}->${tgt}`));
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, undefined, extras);
+
+    await c.handleMessage('s', msg({ author: '111@c.us', body: 'Bonjour' })); // arms pendingLang='fr'
+    await c.handleMessage('s', msg({ author: '111@c.us', body: 'Salut' })); // confirms the switch
+
+    const calls = mocks.sendCombinedReply.mock.calls as unknown[][];
+    // First message: nothing learned yet, so the pre-flip behaviour is unchanged.
+    expect(calls[0][3]).toBe('🇪🇸 ES: en->es');
+    // Flip message: both remaining languages served, and translated FROM the confirmed language.
+    const flip = calls[1][3] as string;
+    expect(flip).toContain('fr->es');
+    expect(flip).toContain('fr->en');
+  });
+
+  it('never delivers an unconfirmed pending language to the group', async () => {
+    // The pending language is offered to the provider only. The backstop must keep using the
+    // unaugmented known languages, or a guess nobody in the group speaks gets broadcast.
+    const state = freshState({
+      announced: true,
+      active: true,
+      participants: {
+        '111@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 5, updatedAt: 'x' },
+        '222@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 5, updatedAt: 'x' },
+      },
+    });
+    const { store, gateway, translator, extras, mocks } = makeDeps(state);
+    mocks.translate.mockImplementation((_text: string, src: string, tgt: string) => Promise.resolve(`${src}->${tgt}`));
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, undefined, extras);
+
+    mocks.detect.mockResolvedValue({ lang: 'fr', confidence: 0.99 });
+    await c.handleMessage('s', msg({ author: '111@c.us', body: 'Bonjour' })); // arms pendingLang='fr'
+    mocks.detect.mockResolvedValue({ lang: 'de', confidence: 0.99 });
+    await c.handleMessage('s', msg({ author: '111@c.us', body: 'Guten Tag' }));
+
+    // The group speaks only 'en'; 'fr' was never confirmed, so nothing is broadcast.
+    expect(mocks.sendCombinedReply).not.toHaveBeenCalled();
+  });
+
   it('sends one contextual request with candidates, hint, glossary and prior history (excluding the current message)', async () => {
     const state = freshState({
       active: true,

@@ -115,10 +115,22 @@ export class TranslationCoordinator {
     }
 
     const knownLangs = this.knownLanguages(state);
+    // A pending language is one confirmation away from becoming the sender's language, and
+    // `applyLearning` may promote it the moment the provider answers. Offer it to the provider so
+    // the message that CONFIRMS the switch is translated from the right language and into every
+    // other language the group speaks — otherwise `targetLanguages` (which runs post-learning)
+    // demands a target the provider was never asked for, and that recipient silently gets nothing.
+    // Deliberately scoped to the request: the sanity rule and backstop below keep using the
+    // unaugmented `knownLangs`, so an unconfirmed guess can never become the effective source.
+    const candidateLangs =
+      sender.pendingLang && !knownLangs.includes(sender.pendingLang)
+        ? [...knownLangs, sender.pendingLang]
+        : [...knownLangs];
+
     const request: TranslateRequest = {
       text,
       senderName: authorName,
-      candidateLangs: knownLangs,
+      candidateLangs,
       hintLang: sender.lang,
       glossary: this.glossary(state, msg.pushName),
       history: this.context.get(sessionId, msg.chatId),
