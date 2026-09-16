@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-16
 **Branch:** `_local-test-combined` (Doug's v0.2.10-based line; see `docs/superpowers/handoffs/2026-09-15-upstream-status-and-translation-replatform.md`)
-**Status:** approved design, awaiting implementation plan
+**Status:** approved; implementation plan at `docs/superpowers/plans/2026-09-16-translation-llm-provider.md`
 
 ## 1. Why this exists
 
@@ -72,7 +72,8 @@ translation/
     libretranslate.contextual.ts (new)  wraps the existing Translator (detect + fan-out) behind the new port
   llm-openai-compatible.client.ts (new) Grok/OpenAI-compatible adapter: prompt, request, validation, breaker,
                                  ModelSwitchable (list via /models or xAI /language-models, set at runtime)
-  core/model-store.ts            (new)  load/save the active model id via ConfigStore-style storage port
+  plugin-model.store.ts          (new)  ModelStore over ctx.storage (beside plugin-config.store.ts; not core)
+  core/errors.ts                 (new)  ProviderRefusedError, AllProvidersFailedError
   libretranslate.client.ts       (unchanged)
   index.ts                       (changed) wires chain = [llm?, libretranslate]; reads new config keys
   plugin-chat.gateway.ts         (unchanged)
@@ -111,7 +112,9 @@ export interface TranslateRequest {
 }
 
 export interface TranslateResult {
-  source: string;             // detected ISO 639-1
+  detected: string;           // raw detection (feeds participant learning, exactly as today)
+  source: string;             // language the translations were made FROM, after the sanity rule
+                              // (`candidateLangs.includes(detected) ? detected : hintLang ?? detected`)
   translations: Translation[];// one per candidateLangs entry != source (may be fewer if a target failed)
   provider: string;           // 'llm' | 'libretranslate'
 }
@@ -142,7 +145,9 @@ export interface ModelSwitchable {
   setModel(id: string): void;
 }
 
-export interface ProviderHealth { name: string; healthy: boolean }
+export interface ProviderHealth { name: string; external: boolean; healthy: boolean }
+export interface ModelSelection { model: string; updatedAt: string; updatedBy: string }
+export interface ModelStore { load(): Promise<ModelSelection | null>; save(sel: ModelSelection): Promise<void> }
 export type ProviderHealthListener = (change: ProviderHealth) => void;
 
 // GroupState additions (persisted via ConfigStore):
@@ -179,7 +184,10 @@ Ordering note: the notice goes after the reply so the reply is still the direct 
 Request: `POST {baseUrl}/chat/completions`, `Authorization: Bearer {apiKey}`, body
 `{ model, temperature: 0.2, response_format: { type: 'json_object' }, messages: [system, user] }`.
 `AbortController` timeout = `llmTimeoutMs`. Circuit breaker identical in shape to `LibreTranslateClient`
-(consecutive-failure threshold, cooldown); on open/close it calls the `ProviderHealthListener`.
+(consecutive-failure threshold, cooldown). `isHealthy()` means "circuit not open" (a half-open circuit after
+cooldown counts as healthy). Only transport failures (timeout, HTTP error, non-JSON body) count toward the
+breaker; a **refusal never does**, because it is about one message's content, not the provider's availability.
+The adapter does not push health events; the chain observes `isHealthy()` after every attempt (section 8).
 
 System prompt (intent; exact wording is the implementer's, but every point must be present):
 - You are a professional translator for a group chat. Translate faithfully, preserving tone, register,
@@ -212,18 +220,21 @@ Model switching (`ModelSwitchable`):
 - `currentModel()` / `setModel(id)`: the adapter holds the active model id in memory; every request uses it.
   `setModel` does not validate against the catalog (a provider may accept ids it does not list); the
   coordinator validates before calling it (section 11a).
-- `listModels()`: `GET {baseUrl}/models` (OpenAI shape, `data[].id`). When `baseUrl` host is `api.x.ai`, use
-  `GET {baseUrl}/language-models` instead, which also returns per-token pricing; map its price fields to USD
-  per 1M tokens (xAI prices are quoted in fractions of a cent per token; the implementer must confirm the
-  unit against the live response and document the conversion in code). Any provider that returns no pricing
-  yields `ModelInfo` without price fields. Cached for 10 minutes to keep `/tr model list` cheap.
+- `listModels()`: `GET {baseUrl}/models` (OpenAI shape, `data[].id`) for every provider. xAI's `/models`
+  response additionally carries `prompt_text_token_price` and `completion_text_token_price`; when those
+  numeric fields are present, divide by **10000** to get USD per 1M tokens (verified live 2026-09-16:
+  `12500` => USD 1.25). Providers without those fields yield `ModelInfo` with no price fields. Cached for
+  10 minutes to keep `/tr model list` cheap.
 
 ## 8. Fallback chain (core/fallback-chain.ts)
 
 `new FallbackChain(providers: ContextualTranslator[], onHealth?: ProviderHealthListener)`
 
 `translateAll(req)`:
-- Iterate providers in order. Skip if `provider.external && !req.allowExternal`. Skip if `!isHealthy()`.
+- Iterate providers in order. Skip if `provider.external && !req.allowExternal`. Do **not** skip on
+  `!isHealthy()`: an open circuit throws instantly inside the provider, and the provider's own cooldown is
+  what lets it recover (skipping would leave `LibreTranslateClient` permanently marked unhealthy, since its
+  health only resets on a successful call).
 - Try; on any throw, log `{action:'translation_provider_failed', provider, reason, refused: bool}` and continue.
 - If none succeeded, throw `AllProvidersFailedError` carrying the per-provider reasons.
 - Result's `provider` field is the provider's `name`.
@@ -231,13 +242,15 @@ Model switching (`ModelSwitchable`):
 `isHealthy()`: true if any provider is healthy. `languages()`: first healthy non-external provider's list,
 else first healthy provider's list.
 
-Health transitions: providers report their own breaker open/close through the listener; the chain
-re-emits `{name, healthy}` only on change (dedupe), so the coordinator can turn transitions into notices.
+Health: `providerHealth(): ProviderHealth[]` returns each provider's `{name, external, healthy}` by polling
+`isHealthy()`. The coordinator calls it after each translation to detect transitions (section 11); no
+push listener is needed.
 
 ## 9. Conversation context (core/conversation-context.ts)
 
 `new ConversationContext({ maxTurns, maxChars })`, default `maxTurns = contextTurns` config (10),
-`maxChars = 2000` (fixed; not user-facing in this cut).
+`maxChars = 2000` (fixed; not user-facing in this cut). The char cap evicts oldest-first but always keeps at
+least the newest turn, so a single long message does not empty the buffer.
 
 - `get(sessionId, chatId): ContextTurn[]` — oldest first.
 - `append(sessionId, chatId, turn)` — drop oldest until both caps hold.
@@ -295,11 +308,13 @@ sufficient, this is an instance-level control):
   "catalog unavailable, switched unverified" confirmation, since the next translation will reveal a bad id
   through the normal fallback path.
 
-Non-operators running any `/tr model` form get the same `denyReply` treatment as other restricted commands
-(silent unless `denyReply` is true).
+Non-operators running any `/tr model` form always get a denial reply ("⛔ Only the instance operator can use
+that command."), matching the coordinator's existing rule that a command never fails silently. (The
+`denyReply` option exists in config but the current coordinator does not consult it; this cut does not change
+that.)
 
-Persistence (`core/model-store.ts`): a single storage key (`llm:model`) holding `{ model: string,
-updatedAt: string, updatedBy: string }` through the same `ctx.storage` the group state uses. On plugin
+Persistence (`plugin-model.store.ts`, implementing the `ModelStore` port): a single storage key
+(`llm:model`) holding `ModelSelection` through the same `ctx.storage` the group state uses. On plugin
 enable/config-change, `index.ts` loads it and, if present, overrides the initial `llmModel` before
 constructing the adapter. This is what makes the switch survive the VM's post-restart config re-PUT.
 
@@ -316,7 +331,7 @@ known. `/tr status` shows the active model so an operator can confirm a switch t
 | `llmBaseUrl` | string | `https://api.x.ai/v1` | Any OpenAI-compatible base; no trailing slash |
 | `llmApiKey` | string (secret) | — | Same handling as `libretranslateApiKey` |
 | `llmModel` | string | `grok-4.20-0309-non-reasoning` | **Initial** model only (D8). A persisted `/tr model switch` choice overrides it (D11). |
-| `operatorWids` | string[] | `[]` | WhatsApp IDs allowed to run `/tr model *`. Doug's ID on the VM. Empty list means nobody can switch models. |
+| `operatorWids` | string[] | `[]` | WhatsApp IDs allowed to run `/tr model *`. Doug's ID on the VM. Empty list means nobody can switch models. The reader also accepts a comma-separated string, since the dashboard form may not render arrays. |
 | `llmTimeoutMs` | number | `8000` | Hook bus has no per-handler timeout (verified 2026-09-16) |
 | `contextTurns` | number | `10` | Ring buffer size |
 | `defaultPrivacy` | `'cloud'|'local'` | `'cloud'` | Instance default (D7) |
@@ -342,9 +357,9 @@ Unit (Jest, colocated `*.spec.ts`, fakes only, no network):
 - `fallback-chain.spec.ts`: skips external when `allowExternal=false`; skips unhealthy; falls through on
   throw; `AllProvidersFailedError` when all fail; health transitions deduped.
 - `conversation-context.spec.ts`: ordering, turn cap, char cap, clear, key isolation.
-- `model-store.spec.ts`: round-trip, absent key yields null.
-- LLM client spec additions: `listModels` parses the OpenAI `/models` shape and the xAI `/language-models`
-  shape with prices; catalog cached; `setModel` changes the model on the next request body.
+- `plugin-model.store.spec.ts`: round-trip, absent key yields null.
+- LLM client spec additions: `listModels` parses the OpenAI `/models` shape with and without xAI price
+  fields (÷10000); catalog cached; `setModel` changes the model on the next request body.
 - `libretranslate.contextual.spec.ts`: detect + fan-out mapping; partial failure yields partial result.
 - `translation.coordinator.spec.ts` (extend): request assembly (candidates, glossary, history excludes
   current message); privacy local forces `allowExternal=false`; disclosure posted exactly once on `on`
