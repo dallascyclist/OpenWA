@@ -7,6 +7,10 @@
 //   XAI_API_KEY=$(cat ../Credentials/openwa-testkey | tr -d '[:space:]') \
 //     npx ts-node --transpile-only scripts/translation-llm-smoke.ts
 //
+// Optional: SMOKE_TEXT=<sample> replaces probe A's message. Doing so SKIPS the name and profanity
+// checks, which assume the built-in sample's "Doug" and its Spanish profanity; a custom sample
+// containing neither would fail them spuriously. Probe B always uses its built-in text.
+//
 // The key is only ever read from the environment. It is never logged: the fetch tee below
 // inspects response bodies only, never the request headers.
 import {
@@ -102,22 +106,31 @@ async function main(): Promise<void> {
   const enA = textFor(resA, 'en');
   console.log('\nper-target name check A:', JSON.stringify(nameReport(resA, 'Doug')));
   console.log('per-target name check B:', JSON.stringify(nameReport(resB, 'Doug')));
-  const checks = {
+  // Every check below asserts something the MODEL could get wrong. Deliberately absent:
+  // `detected === 'es'` (the client assigns `detected: source`, so it only restates sourceIsEs)
+  // and "source not echoed as a target" (the client's own loop skips the source language). Both
+  // would pass regardless of what the provider returned.
+  const checks: Record<string, boolean> = {
     // Probe A
     sourceIsEs: resA.source === 'es',
-    detectedIsEs: resA.detected === 'es',
-    // Checked across EVERY target, not just English: the model preserved "Doug" in English and
-    // Chinese but transliterated it to "Даг" in Russian, which an English-only check never saw.
-    keepsNameInEveryTarget: keepsNameEverywhere(resA, 'Doug'),
-    keepsProfanity: /fuck|damn|hell|shit|bloody|piss/i.test(enA),
     hasRu: resA.translations.some(t => t.lang === 'ru'),
-    noSourceEcho: !resA.translations.some(t => t.lang === resA.source),
     // Probe B
     zhSourceIsEs: resB.source === 'es',
     zhHasZhHansExactSpelling: resB.translations.some(t => t.lang === 'zh-Hans'),
     zhHasHanText: /[一-鿿]/.test(textFor(resB, 'zh-Hans')),
     zhKeepsNameInEveryTarget: keepsNameEverywhere(resB, 'Doug'),
   };
+  // Probe A's content assertions only hold for the built-in sample. A caller-supplied SMOKE_TEXT
+  // need contain neither "Doug" nor anything that translates to English profanity, so asserting
+  // them against it would report a spurious failure rather than a real one.
+  if (process.env.SMOKE_TEXT) {
+    console.log('\nSMOKE_TEXT set: skipping the name and profanity checks (they assume the built-in sample).');
+  } else {
+    // Checked across EVERY target, not just English: the model preserved "Doug" in English and
+    // Chinese but transliterated it to "Даг"/"Дуг" in Russian, which an English-only check missed.
+    checks.keepsNameInEveryTarget = keepsNameEverywhere(resA, 'Doug');
+    checks.keepsProfanity = /fuck|damn|hell|shit|bloody|piss/i.test(enA);
+  }
   console.log('\nchecks:', checks);
   const failed = Object.entries(checks)
     .filter(([, ok]) => !ok)

@@ -1,5 +1,6 @@
 // src/modules/translation/core/translation.coordinator.spec.ts
 import { TranslationCoordinator, CoordinatorOptions, CoordinatorExtras } from './translation.coordinator';
+import { OpenAiCompatibleClient } from '../llm-openai-compatible.client';
 import {
   ChatGateway,
   ConfigStore,
@@ -783,6 +784,62 @@ describe('TranslationCoordinator', () => {
       return { c, mocks: deps.mocks, listModels, save, current: () => model };
     }
 
+    const lastText = (mocks: { sendText: jest.Mock }) =>
+      (mocks.sendText.mock.calls as unknown[][])[mocks.sendText.mock.calls.length - 1][2] as string;
+
+    /**
+     * Like `modelDeps`, but the `models` port is a REAL `OpenAiCompatibleClient` over a mocked
+     * catalog that DOES contain a non-text model. The point is that the model's absence downstream
+     * has to be produced by the client's modality filter rather than by the fixture — a test whose
+     * fixture never held the offending id could not fail under any regression.
+     */
+    function realClientModelDeps(operatorWids: string[]) {
+      const deps = makeDeps(freshState({ announced: true }));
+      global.fetch = jest.fn<Promise<unknown>, [string, RequestInit?]>().mockImplementation((url: string) =>
+        Promise.resolve(
+          url.endsWith('/language-models')
+            ? {
+                ok: true,
+                status: 200,
+                json: () =>
+                  Promise.resolve({
+                    models: [
+                      {
+                        id: 'grok-4.6',
+                        output_modalities: ['text'],
+                        prompt_text_token_price: 20000,
+                        completion_text_token_price: 60000,
+                      },
+                      { id: 'grok-imagine-video', output_modalities: ['video'] },
+                    ],
+                  }),
+              }
+            : { ok: true, status: 200, json: () => Promise.resolve({ data: [] }) },
+        ),
+      ) as never;
+      const models = new OpenAiCompatibleClient({
+        baseUrl: 'https://api.x.ai/v1',
+        apiKey: 'k',
+        model: 'grok-4.6',
+        timeoutMs: 1000,
+      });
+      const save = jest.fn().mockResolvedValue(undefined);
+      const c = new TranslationCoordinator(
+        deps.translator,
+        deps.store,
+        deps.gateway,
+        { ...OPTS, operatorWids },
+        undefined,
+        { ...deps.extras, models, modelStore: { load: jest.fn().mockResolvedValue(null), save } },
+      );
+      return { c, mocks: deps.mocks, save, models };
+    }
+
+    const originalFetch = global.fetch;
+    afterEach(() => {
+      global.fetch = originalFetch;
+    });
+
     it('denies non-operators, even group admins', async () => {
       const { c, mocks } = modelDeps(['999@c.us']);
       mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
@@ -827,25 +884,26 @@ describe('TranslationCoordinator', () => {
       expect(out).toContain('grok-b');
     });
 
-    it('refuses a non-text model the provider filtered out of the catalog', async () => {
-      // `listModels()` now returns text-capable models only, so an image/video id is simply not a
-      // catalog member and falls through the existing unknown-model path. Guards the foot-gun where
-      // `/tr model switch grok-imagine-video` was accepted, persisted, and broke every translation.
-      const { c, mocks, save, current } = modelDeps(['111@c.us']);
+    it('refuses a switch to a model the provider declares as non-text', async () => {
+      // End-to-end guarantee: the client's modality filter is what makes the video model a
+      // non-member, so it falls through the pre-existing unknown-model path instead of being
+      // accepted and persisted. Remove `.filter(isTextCapable)` and this test fails.
+      const { c, mocks, save, models } = realClientModelDeps(['111@c.us']);
       await c.handleMessage('s', msg({ body: '/tr model switch grok-imagine-video' }));
-      expect(current()).toBe('grok-a');
+      expect(models.currentModel()).toBe('grok-4.6');
       expect(save).not.toHaveBeenCalled();
-      const out = (mocks.sendText.mock.calls as unknown[][])[mocks.sendText.mock.calls.length - 1][2] as string;
+      const out = lastText(mocks);
       expect(out).toMatch(/Unknown model "grok-imagine-video"/);
-      // The nearest-match hint draws from the filtered catalog, so it cannot suggest an image model.
+      // The nearest-match hint draws from the filtered catalog, so it cannot suggest one back.
       expect(out).toContain('Use /tr model list.');
     });
 
-    it('never offers a non-text model in the list', async () => {
-      const { c, mocks } = modelDeps(['111@c.us']);
+    it('never offers a model the provider declares as non-text in the list', async () => {
+      const { c, mocks } = realClientModelDeps(['111@c.us']);
       await c.handleMessage('s', msg({ body: '/tr model list' }));
-      const out = (mocks.sendText.mock.calls as unknown[][])[mocks.sendText.mock.calls.length - 1][2] as string;
-      expect(out).not.toContain('imagine');
+      const out = lastText(mocks);
+      expect(out).toContain('grok-4.6'); // the fixture did reach the coordinator...
+      expect(out).not.toContain('grok-imagine-video'); // ...and the filter is what removed this one
     });
 
     it('switches unverified when the catalog is unavailable', async () => {

@@ -240,6 +240,27 @@ describe('OpenAiCompatibleClient', () => {
     expect((global.fetch as jest.Mock).mock.calls).toHaveLength(2);
   });
 
+  it('listModels() converts xAI price fields through the /language-models route', async () => {
+    // The route actually taken against real xAI. Fixture values are the observed live ones:
+    // /language-models carries prompt_text_token_price / completion_text_token_price alongside
+    // output_modalities, so preferring that route costs no pricing information.
+    global.fetch = catalogFetch({
+      languageModels: {
+        models: [
+          {
+            id: 'grok-4.20-0309-non-reasoning',
+            output_modalities: ['text'],
+            prompt_text_token_price: 12500,
+            completion_text_token_price: 25000,
+          },
+        ],
+      },
+    }) as never;
+    expect(await client().listModels()).toEqual([
+      { id: 'grok-4.20-0309-non-reasoning', inputPerMTok: 1.25, outputPerMTok: 2.5 },
+    ]);
+  });
+
   it('listModels() prefers /language-models and never calls /models when the provider has it', async () => {
     global.fetch = catalogFetch({
       languageModels: { models: [{ id: 'grok-4.6', output_modalities: ['text'] }] },
@@ -284,6 +305,26 @@ describe('OpenAiCompatibleClient', () => {
       },
     }) as never;
     expect((await client().listModels()).map(m => m.id)).toEqual(['chat-a', 'bare-c']);
+  });
+
+  it('a successful /language-models probe resets the failure count, like /models does', async () => {
+    global.fetch = jest.fn<Promise<unknown>, [string, RequestInit?]>().mockImplementation((url: string) => {
+      if (url.endsWith('/language-models')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ models: [{ id: 'grok-4.6', output_modalities: ['text'] }] }),
+        });
+      }
+      return Promise.reject(new Error('boom'));
+    }) as never;
+    const c = client({ failureThreshold: 2, catalogTtlMs: 0 });
+
+    await expect(c.translateAll(req())).rejects.toThrow('boom'); // failures: 1
+    await c.listModels(); // reachable provider -> failures reset to 0
+    await expect(c.translateAll(req())).rejects.toThrow('boom'); // failures: 1, not 2
+
+    expect(c.isHealthy()).toBe(true);
   });
 
   it('a missing /language-models endpoint does not count toward the circuit breaker', async () => {
