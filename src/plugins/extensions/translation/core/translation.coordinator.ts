@@ -6,19 +6,37 @@ import {
   InboundMessage,
   ParsedCommand,
   ParticipantState,
-  Translation,
-  Translator,
   TranslationLogger,
   CommandTarget,
+  ContextualTranslator,
+  TranslateRequest,
+  TranslateResult,
+  PrivacyMode,
+  EffectivePrivacy,
+  ModelSwitchable,
+  ModelStore,
+  ProviderHealth,
 } from './ports';
 import { parseCommand } from './command.parser';
 import { buildHelpText, formatCombinedReply, formatStatus } from './reply.formatter';
+import { ConversationContext } from './conversation-context';
 
 export interface CoordinatorOptions {
   prefix: string;
   minLength: number;
   maxLength: number;
   denyReply: boolean;
+  /** Instance default when a group has no override (spec D7). */
+  defaultPrivacy?: PrivacyMode;
+  /** WhatsApp IDs allowed to run `/tr model *` (spec D11). */
+  operatorWids?: string[];
+}
+
+export interface CoordinatorExtras {
+  context?: ConversationContext;
+  models?: ModelSwitchable;
+  modelStore?: ModelStore;
+  providerHealth?: () => ProviderHealth[];
 }
 
 const URL_OR_EMOJI_ONLY = /^(?:\s|\p{Emoji}|https?:\/\/\S+)+$/u;
@@ -38,13 +56,20 @@ function widEquals(a: string, b: string): boolean {
 }
 
 export class TranslationCoordinator {
+  private readonly context: ConversationContext;
+  private readonly extras: CoordinatorExtras;
+
   constructor(
-    private readonly translator: Translator,
+    private readonly translator: ContextualTranslator,
     private readonly store: ConfigStore,
     private readonly gateway: ChatGateway,
     private readonly opts: CoordinatorOptions,
     private readonly logger: TranslationLogger = NOOP_LOGGER,
-  ) {}
+    extras: CoordinatorExtras = {},
+  ) {
+    this.extras = extras;
+    this.context = extras.context ?? new ConversationContext({ maxTurns: 10, maxChars: 2000 });
+  }
 
   async handleMessage(sessionId: string, msg: InboundMessage): Promise<{ swallow: boolean }> {
     if (!msg.isGroup || msg.fromMe || !msg.author) return { swallow: false };
@@ -81,23 +106,47 @@ export class TranslationCoordinator {
     if (msg.pushName && (sender.pushName === undefined || sender.pushName === msg.pushName)) {
       sender.pushName = msg.pushName;
     }
-    if (!sender.enabled) return;
+    const authorName = msg.pushName ?? senderKey.split('@')[0];
 
-    let detected: string;
-    try {
-      detected = (await this.translator.detect(text)).lang;
-    } catch {
-      return; // translator down — silent skip
+    if (!sender.enabled) {
+      // Ignored participants are still part of the conversation the LLM needs to follow (spec D10).
+      this.remember(sessionId, msg.chatId, authorName, sender.lang ?? 'und', text);
+      return;
     }
-    this.applyLearning(sender, detected);
+
+    const knownLangs = this.knownLanguages(state);
+    const request: TranslateRequest = {
+      text,
+      senderName: authorName,
+      candidateLangs: knownLangs,
+      hintLang: sender.lang,
+      glossary: this.glossary(state, msg.pushName),
+      history: this.context.get(sessionId, msg.chatId),
+      allowExternal: this.effectivePrivacy(state).mode === 'cloud',
+    };
+
+    let result: TranslateResult;
+    try {
+      result = await this.translator.translateAll(request);
+    } catch (err) {
+      // A provider failure is still a silent skip, as before, but the turn counts for context.
+      this.logger.warn('translation failed on all providers', {
+        action: 'translation_all_failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.remember(sessionId, msg.chatId, authorName, sender.lang ?? 'und', text);
+      await this.store.save(state);
+      return;
+    }
+
+    this.applyLearning(sender, result.detected);
 
     // Pick the effective source language. Detection misfires on short/colloquial text — it often
     // returns a near-neighbour language (e.g. es misread as gl/ca) — so trust the detected code only
     // when it names a language the group actually uses; otherwise fall back to the sender's known
     // language. Combined with excluding the sender's own language from the targets below, this stops
     // a message ever being "translated" into its own language (the duplicate/echo bug).
-    const knownLangs = this.knownLanguages(state);
-    const source = knownLangs.includes(detected) ? detected : (sender.lang ?? detected);
+    const source = knownLangs.includes(result.detected) ? result.detected : (sender.lang ?? result.detected);
 
     let targets = this.targetLanguages(state, source, sender.lang);
     if (targets.length === 0) {
@@ -110,6 +159,7 @@ export class TranslationCoordinator {
           action: 'translation_no_targets',
           source,
         });
+        this.remember(sessionId, msg.chatId, authorName, source, text);
         await this.store.save(state);
         return;
       }
@@ -124,38 +174,59 @@ export class TranslationCoordinator {
       targets = backstop;
     }
 
-    const settled = await Promise.allSettled(targets.map(t => this.translator.translate(text, source, t)));
-    const translations: Translation[] = [];
-    settled.forEach((r, i) => {
-      if (r.status === 'fulfilled') {
-        translations.push({ lang: targets[i], text: r.value });
-      } else {
-        this.logger.warn('translate call failed', {
+    const translations = result.translations.filter(t => targets.includes(t.lang));
+    for (const t of targets) {
+      if (!translations.some(x => x.lang === t)) {
+        this.logger.warn('target missing from provider result', {
           action: 'translation_translate_failed',
+          provider: result.provider,
           source,
-          target: targets[i],
-          error: String(r.reason),
+          target: t,
         });
       }
-    });
+    }
+
+    this.remember(sessionId, msg.chatId, authorName, source, text);
 
     this.logger.debug('translate decision', {
       action: 'translation_decision',
       author: msg.author,
       resolvedKey: senderKey,
       pushName: msg.pushName,
-      detected,
+      detected: result.detected,
       source,
       senderLang: sender.lang,
       knownLangs,
       targets,
       sent: translations.length,
+      provider: result.provider,
     });
 
     if (translations.length > 0) {
       await this.gateway.sendCombinedReply(sessionId, msg.chatId, msg.id, formatCombinedReply(translations));
     }
     await this.store.save(state);
+  }
+
+  private remember(sessionId: string, chatId: string, author: string, lang: string, text: string): void {
+    this.context.append(sessionId, chatId, { author, lang, text, at: new Date().toISOString() });
+  }
+
+  /** Participant display names the provider must carry through untranslated. */
+  private glossary(state: GroupState, current?: string): string[] {
+    const names = Object.values(state.participants).map(p => p.pushName);
+    names.push(current);
+    return [...new Set(names.filter((n): n is string => typeof n === 'string' && n.length > 0))];
+  }
+
+  private effectivePrivacy(state: GroupState): EffectivePrivacy {
+    if (state.privacy) return { mode: state.privacy, source: 'group' };
+    return { mode: this.opts.defaultPrivacy ?? 'cloud', source: 'instance' };
+  }
+
+  private providerHealth(): ProviderHealth[] {
+    if (this.extras.providerHealth) return this.extras.providerHealth();
+    return [{ name: this.translator.name, external: this.translator.external, healthy: this.translator.isHealthy() }];
   }
 
   /** Distinct languages currently spoken by enabled participants. */
@@ -250,7 +321,11 @@ export class TranslationCoordinator {
       return;
     }
     if (cmd.name === 'status') {
-      await this.gateway.sendText(sessionId, msg.chatId, formatStatus(state, this.translator.isHealthy()));
+      await this.gateway.sendText(
+        sessionId,
+        msg.chatId,
+        formatStatus(state, this.providerHealth(), this.effectivePrivacy(state), this.extras.models?.currentModel()),
+      );
       return;
     }
 
@@ -283,6 +358,8 @@ export class TranslationCoordinator {
         return;
       case 'off':
         state.active = false;
+        // Drop the buffered conversation: it must not leak into a later re-activation.
+        this.context.clear(sessionId, msg.chatId);
         await this.confirm(sessionId, msg, '✅ Translation deactivated.', state);
         return;
       case 'setlang': {
@@ -336,6 +413,9 @@ export class TranslationCoordinator {
         );
         return;
       }
+      case 'privacy':
+      case 'model':
+        return; // implemented in later tasks
     }
   }
 

@@ -1,6 +1,17 @@
 // src/modules/translation/core/translation.coordinator.spec.ts
-import { TranslationCoordinator, CoordinatorOptions } from './translation.coordinator';
-import { ChatGateway, ConfigStore, GroupState, InboundMessage, Translator, TranslationLogger } from './ports';
+import { TranslationCoordinator, CoordinatorOptions, CoordinatorExtras } from './translation.coordinator';
+import {
+  ChatGateway,
+  ConfigStore,
+  GroupState,
+  InboundMessage,
+  Translator,
+  TranslationLogger,
+  ContextualTranslator,
+  TranslateRequest,
+} from './ports';
+import { LibreTranslateContextual } from './libretranslate.contextual';
+import { ConversationContext } from './conversation-context';
 
 const OPTS: CoordinatorOptions = { prefix: '/tr', minLength: 2, maxLength: 2000, denyReply: false };
 
@@ -38,12 +49,19 @@ function makeDeps(state: GroupState) {
   const gateway: ChatGateway = { sendText, sendCombinedReply, getGroupAdmins };
   const translator: Translator = { detect, translate, languages, isHealthy };
   const logger: TranslationLogger = { debug, info, warn };
+  // The coordinator now speaks `ContextualTranslator`; the legacy detect/translate fake reaches it
+  // through the same wrapper production uses, so `mocks.detect`/`mocks.translate` still drive it.
+  const contextual: ContextualTranslator = new LibreTranslateContextual(translator, logger);
+  const context = new ConversationContext({ maxTurns: 10, maxChars: 2000 });
+  const extras: CoordinatorExtras = { context };
 
   return {
     store,
     gateway,
-    translator,
+    translator: contextual,
     logger,
+    context,
+    extras,
     saved,
     mocks: {
       load,
@@ -345,5 +363,161 @@ describe('TranslationCoordinator', () => {
       'translate decision',
       expect.objectContaining({ detected: 'en', source: 'en', sent: 1 }),
     );
+  });
+
+  it('sends one contextual request with candidates, hint, glossary and prior history (excluding the current message)', async () => {
+    const state = freshState({
+      active: true,
+      announced: true,
+      participants: {
+        '111@c.us': { lang: 'es', source: 'learned', enabled: true, samples: 2, updatedAt: '', pushName: 'Ana' },
+        '222@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 2, updatedAt: '', pushName: 'Doug' },
+      },
+    });
+    const { store, gateway, context, extras, mocks } = makeDeps(state);
+    const translateAll = jest.fn().mockResolvedValue({
+      detected: 'es',
+      source: 'es',
+      translations: [{ lang: 'en', text: 'hi' }],
+      provider: 'llm',
+    });
+    const fake: ContextualTranslator = {
+      name: 'llm',
+      external: true,
+      translateAll,
+      languages: mocks.languages,
+      isHealthy: () => true,
+    };
+    context.append('s', 'g@g.us', { author: 'Doug', lang: 'en', text: 'earlier', at: 'x' });
+    const c = new TranslationCoordinator(fake, store, gateway, OPTS, undefined, extras);
+
+    await c.handleMessage('s', msg({ body: 'hola Doug', author: '111@c.us', pushName: 'Ana' }));
+
+    expect(translateAll).toHaveBeenCalledTimes(1);
+    const req = (translateAll.mock.calls as unknown[][])[0][0] as TranslateRequest;
+    expect(req).toMatchObject({
+      text: 'hola Doug',
+      senderName: 'Ana',
+      hintLang: 'es',
+      allowExternal: true,
+    });
+    expect([...req.candidateLangs].sort()).toEqual(['en', 'es']);
+    expect([...req.glossary].sort()).toEqual(['Ana', 'Doug']);
+    expect(req.history.map(t => t.text)).toEqual(['earlier']);
+    expect(mocks.sendCombinedReply).toHaveBeenCalledWith('s', 'g@g.us', 'M1', expect.stringContaining('hi'));
+    // The current message joins the buffer only AFTER the round-trip, so it is never its own context.
+    expect(context.get('s', 'g@g.us').map(t => t.text)).toEqual(['earlier', 'hola Doug']);
+    expect(context.get('s', 'g@g.us')[1]).toMatchObject({ author: 'Ana', lang: 'es' });
+  });
+
+  it('records an ignored participant message in context without translating it', async () => {
+    const state = freshState({
+      active: true,
+      announced: true,
+      participants: {
+        '111@c.us': { lang: 'es', source: 'learned', enabled: false, samples: 2, updatedAt: '' },
+      },
+    });
+    const { store, gateway, translator, context, extras, mocks } = makeDeps(state);
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, undefined, extras);
+    await c.handleMessage('s', msg({ body: 'hola', author: '111@c.us' }));
+    expect(mocks.detect).not.toHaveBeenCalled();
+    expect(context.get('s', 'g@g.us')).toEqual([expect.objectContaining({ text: 'hola', lang: 'es' })]);
+  });
+
+  it('still records the turn (lang und) when the provider fails, and stays silent', async () => {
+    const state = freshState({ active: true, announced: true });
+    const { store, gateway, translator, context, extras, mocks } = makeDeps(state);
+    mocks.detect.mockRejectedValue(new Error('down'));
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, undefined, extras);
+    await c.handleMessage('s', msg({ body: 'hola' }));
+    expect(mocks.sendCombinedReply).not.toHaveBeenCalled();
+    expect(context.get('s', 'g@g.us')).toEqual([expect.objectContaining({ text: 'hola', lang: 'und' })]);
+  });
+
+  it('clears the context on /tr off', async () => {
+    const state = freshState({ active: true, announced: true });
+    const { store, gateway, translator, context, extras, mocks } = makeDeps(state);
+    mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
+    context.append('s', 'g@g.us', { author: 'x', lang: 'en', text: 'old', at: 'x' });
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, undefined, extras);
+    await c.handleMessage('s', msg({ body: '/tr off' }));
+    expect(context.get('s', 'g@g.us')).toEqual([]);
+  });
+
+  it('filters provider translations down to the computed targets', async () => {
+    // Sender speaks es; en is the only computed target (the ru participant is ignored, so ru is
+    // neither a known language nor a target). The provider answers with en+ru anyway.
+    const state = freshState({
+      active: true,
+      announced: true,
+      participants: {
+        '111@c.us': { lang: 'es', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+        '222@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+        '333@c.us': { lang: 'ru', source: 'learned', enabled: false, samples: 2, updatedAt: '' },
+      },
+    });
+    const { store, gateway, extras, mocks } = makeDeps(state);
+    const translateAll = jest.fn().mockResolvedValue({
+      detected: 'es',
+      source: 'es',
+      translations: [
+        { lang: 'en', text: 'hi' },
+        { lang: 'ru', text: 'privet' },
+      ],
+      provider: 'llm',
+    });
+    const fake: ContextualTranslator = {
+      name: 'llm',
+      external: true,
+      translateAll,
+      languages: mocks.languages,
+      isHealthy: () => true,
+    };
+    const c = new TranslationCoordinator(fake, store, gateway, OPTS, undefined, extras);
+    await c.handleMessage('s', msg({ body: 'hola', author: '111@c.us' }));
+    const sent = (mocks.sendCombinedReply.mock.calls as unknown[][])[0][3] as string;
+    expect(sent).toContain('hi');
+    expect(sent).not.toContain('privet');
+  });
+
+  it('reports provider health, privacy and participants on /tr status', async () => {
+    const state = freshState({
+      active: true,
+      announced: true,
+      participants: {
+        '111@c.us': { lang: 'es', source: 'pinned', enabled: true, samples: 2, updatedAt: 'x' },
+      },
+    });
+    const { store, gateway, translator, extras, mocks } = makeDeps(state);
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, undefined, extras);
+    await c.handleMessage('s', msg({ body: '/tr status' }));
+    const sent = (mocks.sendText.mock.calls as unknown[][])[0][2] as string;
+    expect(sent).toContain('Translation: ACTIVE');
+    // No `providerHealth` override: exercises the CoordinatorExtras fallback, which reports the
+    // wired translator (the LibreTranslate wrapper) and therefore no LLM.
+    expect(sent).toContain('AI translator: disabled');
+    expect(sent).toContain('Basic translator (libretranslate): ok');
+    expect(sent).toContain('Privacy: cloud (instance default)');
+    expect(sent).toContain('• 111@c.us: es (pinned)');
+  });
+
+  it('reports the active model on /tr status when a model-switchable provider is configured', async () => {
+    const state = freshState({ active: true, announced: true, privacy: 'cloud' });
+    const { store, gateway, translator, context, mocks } = makeDeps(state);
+    const extras: CoordinatorExtras = {
+      context,
+      models: { listModels: jest.fn().mockResolvedValue([]), currentModel: () => 'grok-4-fast', setModel: jest.fn() },
+      providerHealth: () => [
+        { name: 'llm', external: true, healthy: true },
+        { name: 'libretranslate', external: false, healthy: false },
+      ],
+    };
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, undefined, extras);
+    await c.handleMessage('s', msg({ body: '/tr status' }));
+    const sent = (mocks.sendText.mock.calls as unknown[][])[0][2] as string;
+    expect(sent).toContain('AI translator (grok-4-fast): ok');
+    expect(sent).toContain('Basic translator (libretranslate): unreachable');
+    expect(sent).toContain('Privacy: cloud (group override)');
   });
 });
