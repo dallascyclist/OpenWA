@@ -124,6 +124,21 @@ const LLM_LANGUAGES = [
  */
 const LANG_CODE_RE = /^[a-z]{2,3}(-[a-z0-9]{2,8})*$/i;
 
+/**
+ * ISO 639-2 placeholders that are well-formed codes but name no language: `und` (undetermined),
+ * `mul` (multiple languages), `zxx` (no linguistic content). They must never become a `source`.
+ * `source` is what the coordinator feeds to `applyLearning`, and on a participant's first message
+ * learning adopts the detected code immediately — so one `"source":"und"` answer would make `und`
+ * one of the group's known languages, and from then on every message gets a target of `und` that
+ * the provider is asked to translate *into*. Rejecting them here makes the whole attempt a provider
+ * failure, which is correct: the chain then falls through to LibreTranslate.
+ */
+const NON_LANGUAGE_CODES = new Set(['und', 'mul', 'zxx']);
+
+function isUsableLangCode(code: string): boolean {
+  return LANG_CODE_RE.test(code) && !NON_LANGUAGE_CODES.has(code.split('-')[0].toLowerCase());
+}
+
 const REFUSAL_RE = /\b(i can(?:no|')t|i'?m sorry|i am sorry|i (?:am )?unable to|i won'?t)\b/i;
 
 export interface OpenAiCompatibleOptions {
@@ -198,7 +213,7 @@ export class OpenAiCompatibleClient implements ContextualTranslator, ModelSwitch
 
     const parsed = parseModelJson(content);
     const rawSource = parsed.source;
-    if (typeof rawSource !== 'string' || !LANG_CODE_RE.test(rawSource)) {
+    if (typeof rawSource !== 'string' || !isUsableLangCode(rawSource)) {
       throw new Error(`LLM returned invalid source: ${String(rawSource)}`);
     }
     // Canonicalize before anything downstream — including participant learning — sees it.

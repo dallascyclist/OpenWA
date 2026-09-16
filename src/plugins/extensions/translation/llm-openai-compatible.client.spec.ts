@@ -133,6 +133,17 @@ describe('OpenAiCompatibleClient', () => {
     await expect(client().translateAll(req())).rejects.toThrow(/invalid source/);
   });
 
+  // `und`/`mul`/`zxx` are well-formed ISO 639-2 codes that name no language. `source` becomes
+  // `detected`, which the coordinator feeds to participant learning — and on a participant's first
+  // message learning adopts it at once, so accepting one would put a pseudo-language into the
+  // group's known set and have the provider asked to translate *into* it from then on.
+  it.each(['und', 'mul', 'zxx', 'UND', 'und-Latn'])('rejects the non-language source code %s', async code => {
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue(completion(`{"source":"${code}","translations":{"en":"hi","ru":"x"}}`)) as never;
+    await expect(client().translateAll(req())).rejects.toThrow(/invalid source/);
+  });
+
   it('accepts a BCP-47 source with a script subtag (LibreTranslate emits zh-Hans)', async () => {
     global.fetch = jest
       .fn()
