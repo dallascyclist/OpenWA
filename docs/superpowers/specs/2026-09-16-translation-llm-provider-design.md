@@ -204,8 +204,8 @@ User message: `JSON.stringify(req)` minus `allowExternal` (irrelevant to the mod
 
 Response validation (any failure throws, which the chain treats as a provider failure):
 - HTTP 2xx; `choices[0].message.content` present.
-- Content parses as JSON (tolerate leading/trailing prose or code fences by extracting the first balanced
-  `{...}`; some providers ignore `response_format`).
+- Content parses as JSON (tolerate leading/trailing prose or code fences by retrying on the span from the
+  first `{` to the last `}`; some providers ignore `response_format`).
 - `source` is a language code, not prose: a 2-3 letter base code, optionally followed by BCP-47
   script/region subtags and matched case-insensitively (`/^[a-z]{2,3}(-[a-z0-9]{2,8})*$/i`). Subtags are
   accepted because LibreTranslate emits codes like `zh-Hans`, which therefore reach the model in

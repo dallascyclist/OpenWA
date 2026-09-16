@@ -189,10 +189,12 @@ export class OpenAiCompatibleClient implements ContextualTranslator, ModelSwitch
     if (typeof content !== 'string') throw new Error('LLM response missing message content');
 
     const parsed = parseModelJson(content);
-    const source = parsed.source;
-    if (typeof source !== 'string' || !LANG_CODE_RE.test(source)) {
-      throw new Error(`LLM returned invalid source: ${String(source)}`);
+    const rawSource = parsed.source;
+    if (typeof rawSource !== 'string' || !LANG_CODE_RE.test(rawSource)) {
+      throw new Error(`LLM returned invalid source: ${String(rawSource)}`);
     }
+    // Canonicalize before anything downstream — including participant learning — sees it.
+    const source = canonicalizeLang(rawSource, req.candidateLangs);
     const map = parsed.translations;
     if (typeof map !== 'object' || map === null) throw new ProviderRefusedError('translations object missing');
 
@@ -253,6 +255,19 @@ function userPayload(req: TranslateRequest): Omit<TranslateRequest, 'allowExtern
   const { allowExternal: _omit, ...rest } = req;
   void _omit;
   return rest;
+}
+
+/**
+ * Return the group's own spelling of a language code. The model may echo `zh-hans` where
+ * `candidateLangs` holds `zh-Hans`; left alone, that reaches `detected`, is persisted by participant
+ * learning as a second language, and the group then gets every later message translated twice — once
+ * per spelling. A code with no case-insensitive match is a language the group does not speak yet and
+ * is returned untouched.
+ */
+function canonicalizeLang(lang: string, candidateLangs: string[]): string {
+  if (candidateLangs.includes(lang)) return lang;
+  const lower = lang.toLowerCase();
+  return candidateLangs.find(c => c.toLowerCase() === lower) ?? lang;
 }
 
 /**

@@ -131,6 +131,19 @@ describe('OpenAiCompatibleClient', () => {
     });
   });
 
+  it("canonicalizes a case-drifted source to the group's spelling", async () => {
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue(completion('{"source":"zh-hans","translations":{"en":"hi","ru":"x"}}')) as never;
+    const out = await client().translateAll(req({ candidateLangs: ['en', 'zh-Hans', 'ru'], hintLang: 'zh-Hans' }));
+    expect(out.detected).toBe('zh-Hans');
+    expect(out.source).toBe('zh-Hans');
+    expect(out.translations).toEqual([
+      { lang: 'en', text: 'hi' },
+      { lang: 'ru', text: 'x' },
+    ]);
+  });
+
   it('matches a target key case-insensitively rather than calling it a refusal', async () => {
     global.fetch = jest
       .fn()
