@@ -113,8 +113,13 @@ export interface TranslateRequest {
 
 export interface TranslateResult {
   detected: string;           // raw detection (feeds participant learning, exactly as today)
-  source: string;             // language the translations were made FROM, after the sanity rule
-                              // (`candidateLangs.includes(detected) ? detected : hintLang ?? detected`)
+  source: string;             // language the translations were made FROM = the one candidateLangs
+                              // entry `translations` omits. That omission is the only guarantee
+                              // common to both providers; how each derives it differs.
+                              // LibreTranslateContextual: the sanity rule
+                              // (`candidateLangs.includes(detected) ? detected : hintLang ?? detected`).
+                              // LLM client: the model's own answer, canonicalized, no hint
+                              // fallback — so there `source === detected`.
   translations: Translation[];// one per candidateLangs entry != source (may be fewer if a target failed)
   provider: string;           // 'llm' | 'libretranslate'
 }
@@ -167,7 +172,15 @@ The existing `Translator` port stays for `LibreTranslateClient`; `LibreTranslate
    behaviour).
 4. `applyLearning(sender, result.detected)` — unchanged debounce logic.
 5. `source = knownLangs.includes(result.detected) ? result.detected : (sender.lang ?? result.detected)` —
-   unchanged sanity rule.
+   unchanged sanity rule. **`knownLangs` here is recomputed after step 4**, and is a different array from
+   the one that built `candidateLangs` in step 2. Step 4 can move the sender onto a new language, which
+   both adds that language to the group's set and — when the sender was the last speaker of their old
+   one — removes the old one. The sanity rule and the step-6 backstop must see the group as it is now;
+   reusing the step-2 array makes the message that *confirms* a language switch get translated into the
+   language the group has just abandoned, because the backstop still sees the stale entry and fires
+   instead of staying silent. Step 2's array must equally not be recomputed: it describes the group as it
+   was when the provider was asked, including the `pendingLang` augmentation that is deliberately scoped
+   to `candidateLangs` alone.
 
    Steps 4-5 read `result.detected`, not `result.source`. The two fields differ by design (section 5):
    `detected` is the raw detection, and `source` is the language that provider chose to translate *from*
@@ -344,11 +357,34 @@ What never enters: commands, the bot's own sends, messages below `minLength`, UR
   leaves the flag unset and the notice is retried, erring toward disclosing twice rather than translating
   externally having never disclosed once.
 - Disclosure text (formatter; wording may be refined): "ℹ️ Translations in this group are produced by an
-  external AI service; message text is sent to that provider for translation. An admin can switch to
-  local-only translation with `/tr privacy local`."
+  external AI service: messages sent here go to that provider, along with recent messages kept for context
+  — including ones the bot does not translate — and participants' display names. An admin can switch to
+  local-only translation with `/tr privacy local`." The notice must not understate the payload: the
+  provider receives the sender's display name, a glossary of every participant's display name, and up to
+  `contextTurns` prior turns, which include messages from ignored participants (D10) and messages buffered
+  while a provider was down. A compliance notice that named only "message text" would be an
+  understatement, which is the wrong direction to err in.
 - Help text gains the `privacy` line.
 
 `allowExternal` is evaluated per message, so flipping the mode takes effect immediately with no restart.
+
+### 10a. Limitation: `local` means "no LLM", not "nothing leaves the box"
+
+`LibreTranslateContextual` hard-codes `external = false`, so LibreTranslate is never skipped by a
+`local` group and never triggers the disclosure. That is accurate for the intended deployment
+(`libretranslateUrl` pointing at an in-stack or on-host LibreTranslate) but it is a property of the
+provider class, not of the configured URL. An operator who points `libretranslateUrl` at a hosted
+LibreTranslate — the config schema's own example offers `https://libretranslate.com` — sends message
+text off-box from every group, including groups that explicitly chose `local`, with no disclosure.
+
+**Deriving `external` from the URL is deliberately rejected, not merely unimplemented.** The production
+VM uses `http://libretranslate:5000`: a Docker service name that is neither a loopback nor a private-IP
+literal, so any naive host check classifies the in-stack LibreTranslate as external. Every `local`
+group would then skip its only provider and lose translation entirely — a far worse failure than the
+documented gap. Anything better would need an explicit operator-declared trust flag, which is not in
+this cut. Until then the limitation is documented here, mirrored in the `libretranslateUrl` field
+description in `src/plugins/extensions/extensions.module.ts` so an operator meets it at the point of
+decision, and listed in §18.
 
 ## 11. Degraded and recovered notices
 
@@ -573,8 +609,15 @@ originally named `CLAUDE.md` as *the* destination for these notes, and the plan'
   slow leak at worst, but it is unbounded in principle.
 - The conversation buffer appends in *completion* order, not arrival order, when messages are handled
   concurrently. Context can therefore be slightly out of order under load.
-- `translation/manifest.json` is stale but dead — the loader scans `./plugins`, not `src/`, so nothing reads
-  it. Delete it or update it; leaving it is a trap for the next reader.
+- ~~`translation/manifest.json` is stale but dead~~ — resolved: deleted. The loader scans `./plugins`, not
+  `src/`, so nothing read it.
+- **`local` privacy does not guarantee the text stays on the box** (§10a). `LibreTranslateContextual` is
+  hard-coded `external = false`, so a `libretranslateUrl` pointing at a hosted LibreTranslate sends message
+  text off-box from `local` groups with no disclosure. Deriving `external` from the URL is rejected — the
+  production VM's `http://libretranslate:5000` is a Docker service name, so a host check would misclassify
+  it as external and silently disable translation for every `local` group. The real fix is an explicit
+  operator-declared trust flag on the provider config; until then the limitation is documented in §10a and
+  in the `libretranslateUrl` field description.
 - `buildCoordinator` is long enough to want decomposing if it grows again.
 - `index.spec.ts` reaches private fields through casts.
 - The circuit-open path logs via `console.warn`, which makes test output non-pristine. The right fix is a

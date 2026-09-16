@@ -48,7 +48,10 @@ export class ExtensionsRegistrar implements OnModuleInit {
             type: 'string',
             title: 'LibreTranslate URL',
             description:
-              'Base URL of the LibreTranslate instance (e.g. http://libretranslate:7001 or https://libretranslate.com).',
+              'Base URL of the LibreTranslate instance (e.g. http://libretranslate:7001 or https://libretranslate.com). ' +
+              'Privacy note: this provider is always treated as non-external, so groups set to `local` privacy still ' +
+              'use it and no external-AI disclosure is posted for it. Point it at a hosted LibreTranslate and message ' +
+              'text leaves the instance undisclosed — keep it on a host you control if that matters.',
             default: 'http://localhost:7001',
             required: true,
           },

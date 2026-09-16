@@ -40,9 +40,17 @@ export function buildHelpText(prefix: string): string {
   ].join('\n');
 }
 
+/**
+ * Compliance notice, so it must not understate the payload. The provider receives more than the one
+ * message being translated: the sender's display name, a glossary of every participant's display
+ * name, and up to `contextTurns` recent messages — which include messages from participants the bot
+ * ignores and messages it never got to translate.
+ */
 export function buildDisclosureText(prefix: string): string {
   return (
-    'ℹ️ Translations in this group are produced by an external AI service; message text is sent to that provider for translation. ' +
+    'ℹ️ Translations in this group are produced by an external AI service: messages sent here go to that ' +
+    'provider, along with recent messages kept for context — including ones the bot does not translate — ' +
+    'and participants’ display names. ' +
     `An admin can switch to local-only translation with \`${prefix} privacy local\`.`
   );
 }

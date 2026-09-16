@@ -133,7 +133,17 @@ export interface TranslateRequest {
 
 export interface TranslateResult {
   detected: string; // raw detection; feeds participant learning
-  source: string; // language translated FROM after the sanity rule
+  /**
+   * The language the provider actually translated FROM — equivalently, the one `candidateLangs`
+   * entry that `translations` deliberately omits. That omission is the only guarantee shared by
+   * both implementations; how each arrives at the value differs. `LibreTranslateContextual` applies
+   * the hint-based sanity rule (`candidateLangs.includes(detected) ? detected : hintLang ?? detected`)
+   * to its own detection, whereas the LLM client returns the model's own answer canonicalized to the
+   * group's spelling and no hint fallback, so there `source === detected`. The coordinator therefore
+   * does not trust this field for its own decisions: it re-derives a source from `detected` against
+   * the group's post-learning languages.
+   */
+  source: string;
   translations: Translation[]; // one per candidateLangs entry !== source (fewer on partial failure)
   provider: string; // 'llm' | 'libretranslate'
 }

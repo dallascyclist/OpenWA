@@ -93,6 +93,16 @@ describe('reply.formatter', () => {
     expect(out).toContain('/tr privacy local');
   });
 
+  // It is a compliance notice, so it has to cover the whole payload, not just the one message being
+  // translated: recent turns (including ones from ignored participants) and display names go too.
+  it('buildDisclosureText discloses the context turns and display names, not just the one message', () => {
+    const out = buildDisclosureText('/tr');
+    expect(out).toMatch(/recent messages/i);
+    expect(out).toMatch(/context/i);
+    expect(out).toMatch(/display names/i);
+    expect(out).toMatch(/does not translate/i);
+  });
+
   it('formatHealthNotice distinguishes provider and direction', () => {
     expect(formatHealthNotice({ name: 'llm', external: true, healthy: false })).toBe(
       '⚠️ AI translation is temporarily unavailable; using basic translation until it recovers.',
