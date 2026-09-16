@@ -36,7 +36,7 @@ export class ExtensionsRegistrar implements OnModuleInit {
       version: '1.0.0',
       type: PluginType.EXTENSION,
       description:
-        "Auto-translates group messages between participants' languages via LibreTranslate. Configure in-group with /tr commands. Disabled by default.",
+        "Auto-translates group messages between participants' languages via an AI translator (Grok by default) with a LibreTranslate fallback. Configure in-group with /tr commands. Disabled by default.",
       main: 'index.ts',
       permissions: ['messages:send'],
       sessions: ['*'],
@@ -68,6 +68,41 @@ export class ExtensionsRegistrar implements OnModuleInit {
             title: 'Reply on denied commands',
             description: "Reply with an 'admins only' message when a non-admin runs a restricted command.",
             default: false,
+          },
+          llmEnabled: {
+            type: 'boolean',
+            title: 'Enable AI translator',
+            description:
+              'Use an OpenAI-compatible LLM (Grok by default) as the primary translator, with LibreTranslate as the fallback.',
+            default: false,
+          },
+          llmBaseUrl: {
+            type: 'string',
+            title: 'AI base URL',
+            description: 'OpenAI-compatible API base, e.g. https://api.x.ai/v1 or an Ollama/LM Studio endpoint.',
+            default: 'https://api.x.ai/v1',
+          },
+          llmApiKey: { type: 'string', title: 'AI API key', secret: true },
+          llmModel: {
+            type: 'string',
+            title: 'AI model (initial)',
+            description: 'Initial model id. An operator can change it at runtime with /tr model switch.',
+            default: 'grok-4.20-0309-non-reasoning',
+          },
+          llmTimeoutMs: { type: 'number', title: 'AI timeout (ms)', default: 8000 },
+          contextTurns: { type: 'number', title: 'Context turns sent to the AI', default: 10 },
+          defaultPrivacy: {
+            type: 'string',
+            title: 'Default privacy mode',
+            description:
+              "'cloud' allows the AI translator by default; 'local' uses only LibreTranslate until a group opts in with /tr privacy cloud.",
+            default: 'cloud',
+          },
+          operatorWids: {
+            type: 'array',
+            title: 'Operator WhatsApp IDs',
+            description:
+              'IDs allowed to run /tr model commands (e.g. 1234567890@c.us). A comma-separated string is also accepted.',
           },
         },
       },

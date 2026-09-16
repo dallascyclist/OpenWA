@@ -51,6 +51,19 @@ describe('ConversationContext', () => {
     expect(ctx.get('s1', 'h').map(t => t.text)).toEqual(['h']);
   });
 
+  it('clamps maxTurns to at least 1 so an operator-set 0 still keeps the newest turn', () => {
+    const ctx = new ConversationContext({ maxTurns: 0, maxChars: 1000 });
+    ctx.append('s', 'g', turn('one'));
+    ctx.append('s', 'g', turn('two'));
+    expect(ctx.get('s', 'g').map(t => t.text)).toEqual(['two']);
+  });
+
+  it('clamps a negative maxTurns the same way', () => {
+    const ctx = new ConversationContext({ maxTurns: -5, maxChars: 1000 });
+    ctx.append('s', 'g', turn('only'));
+    expect(ctx.get('s', 'g').map(t => t.text)).toEqual(['only']);
+  });
+
   it('clear() empties one chat only', () => {
     const ctx = new ConversationContext({ maxTurns: 5, maxChars: 1000 });
     ctx.append('s', 'g', turn('g'));

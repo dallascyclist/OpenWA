@@ -10,8 +10,16 @@ export interface ConversationContextOptions {
 
 export class ConversationContext {
   private readonly buffers = new Map<string, ContextTurn[]>();
+  /**
+   * `maxTurns` is operator-editable (plugin config `contextTurns`), so it is clamped here rather
+   * than at the call site. A value of 0 would silently disable context; a negative one makes the
+   * eviction loop below spin forever, because `[].length > -1` never stops being true.
+   */
+  private readonly maxTurns: number;
 
-  constructor(private readonly opts: ConversationContextOptions) {}
+  constructor(private readonly opts: ConversationContextOptions) {
+    this.maxTurns = Number.isFinite(opts.maxTurns) ? Math.max(1, Math.floor(opts.maxTurns)) : 1;
+  }
 
   private key(sessionId: string, chatId: string): string {
     return `${sessionId}:${chatId}`;
@@ -25,7 +33,7 @@ export class ConversationContext {
     const k = this.key(sessionId, chatId);
     const buf = this.buffers.get(k) ?? [];
     buf.push(turn);
-    while (buf.length > this.opts.maxTurns) buf.shift();
+    while (buf.length > this.maxTurns) buf.shift();
     // Character cap: evict oldest-first but always keep the newest turn.
     while (buf.length > 1 && totalChars(buf) > this.opts.maxChars) buf.shift();
     this.buffers.set(k, buf);
