@@ -100,11 +100,15 @@ async function main(): Promise<void> {
   console.log('raw translation keys B: ', JSON.stringify(rawKeysOf(rawB)));
 
   const enA = textFor(resA, 'en');
+  console.log('\nper-target name check A:', JSON.stringify(nameReport(resA, 'Doug')));
+  console.log('per-target name check B:', JSON.stringify(nameReport(resB, 'Doug')));
   const checks = {
     // Probe A
     sourceIsEs: resA.source === 'es',
     detectedIsEs: resA.detected === 'es',
-    keepsName: enA.includes('Doug'),
+    // Checked across EVERY target, not just English: the model preserved "Doug" in English and
+    // Chinese but transliterated it to "Даг" in Russian, which an English-only check never saw.
+    keepsNameInEveryTarget: keepsNameEverywhere(resA, 'Doug'),
     keepsProfanity: /fuck|damn|hell|shit|bloody|piss/i.test(enA),
     hasRu: resA.translations.some(t => t.lang === 'ru'),
     noSourceEcho: !resA.translations.some(t => t.lang === resA.source),
@@ -112,7 +116,7 @@ async function main(): Promise<void> {
     zhSourceIsEs: resB.source === 'es',
     zhHasZhHansExactSpelling: resB.translations.some(t => t.lang === 'zh-Hans'),
     zhHasHanText: /[一-鿿]/.test(textFor(resB, 'zh-Hans')),
-    zhKeepsName: textFor(resB, 'en').includes('Doug'),
+    zhKeepsNameInEveryTarget: keepsNameEverywhere(resB, 'Doug'),
   };
   console.log('\nchecks:', checks);
   const failed = Object.entries(checks)
@@ -127,6 +131,16 @@ async function main(): Promise<void> {
 
 function textFor(res: TranslateResult, lang: string): string {
   return res.translations.find(t => t.lang === lang)?.text ?? '';
+}
+
+/** A glossary name must survive verbatim in EVERY target, including non-Latin scripts. */
+function keepsNameEverywhere(res: TranslateResult, name: string): boolean {
+  return res.translations.length > 0 && res.translations.every(t => t.text.includes(name));
+}
+
+/** Per-target breakdown, so a failure names the language that dropped the glossary term. */
+function nameReport(res: TranslateResult, name: string): Record<string, boolean> {
+  return Object.fromEntries(res.translations.map(t => [t.lang, t.text.includes(name)]));
 }
 
 /** Pull the model's own, un-canonicalized `source` out of the raw completion content. */

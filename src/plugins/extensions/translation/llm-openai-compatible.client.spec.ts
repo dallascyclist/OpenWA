@@ -20,6 +20,24 @@ const completion = (content: string) => ({
   json: () => Promise.resolve({ choices: [{ message: { content } }] }),
 });
 
+/**
+ * Routes by URL so the `/language-models` probe and the `/models` fallback stay distinguishable.
+ * Omitting `languageModels` simulates a provider without that endpoint (OpenAI, Ollama, LM Studio),
+ * which answers 404.
+ */
+const catalogFetch = (routes: { languageModels?: unknown; models?: unknown }) =>
+  jest.fn<Promise<unknown>, [string, RequestInit?]>().mockImplementation((url: string) => {
+    if (url.endsWith('/language-models')) {
+      const status = routes.languageModels ? 200 : 404;
+      return Promise.resolve({
+        ok: status === 200,
+        status,
+        json: () => Promise.resolve(routes.languageModels ?? {}),
+      });
+    }
+    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(routes.models ?? { data: [] }) });
+  });
+
 function client(over: Partial<ConstructorParameters<typeof OpenAiCompatibleClient>[0]> = {}) {
   return new OpenAiCompatibleClient({
     baseUrl: 'https://api.x.ai/v1/',
@@ -197,39 +215,92 @@ describe('OpenAiCompatibleClient', () => {
   });
 
   it('listModels() parses the OpenAI shape without prices', async () => {
-    global.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: () => Promise.resolve({ object: 'list', data: [{ id: 'gpt-x', object: 'model' }] }),
-    }) as never;
+    global.fetch = catalogFetch({ models: { object: 'list', data: [{ id: 'gpt-x', object: 'model' }] } }) as never;
     const c = client({ baseUrl: 'https://api.openai.com/v1' });
     expect(await c.listModels()).toEqual([{ id: 'gpt-x' }]);
-    const [url, init] = (global.fetch as jest.Mock).mock.calls[0] as [string, RequestInit];
+    const [url, init] = (global.fetch as jest.Mock).mock.calls[1] as [string, RequestInit];
     expect(url).toBe('https://api.openai.com/v1/models');
     expect(init.method).toBe('GET');
     expect(init.body).toBeUndefined();
   });
 
   it('listModels() converts xAI price fields to USD per 1M tokens', async () => {
-    global.fetch = jest.fn().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: () =>
-        Promise.resolve({
-          data: [{ id: 'grok-4.3', prompt_text_token_price: 12500, completion_text_token_price: 25000 }],
-        }),
+    global.fetch = catalogFetch({
+      models: { data: [{ id: 'grok-4.3', prompt_text_token_price: 12500, completion_text_token_price: 25000 }] },
     }) as never;
     expect(await client().listModels()).toEqual([{ id: 'grok-4.3', inputPerMTok: 1.25, outputPerMTok: 2.5 }]);
   });
 
   it('listModels() caches the catalog', async () => {
-    global.fetch = jest
-      .fn()
-      .mockResolvedValue({ ok: true, status: 200, json: () => Promise.resolve({ data: [{ id: 'a' }] }) }) as never;
+    global.fetch = catalogFetch({ models: { data: [{ id: 'a' }] } }) as never;
     const c = client();
     await c.listModels();
     await c.listModels();
-    expect((global.fetch as jest.Mock).mock.calls).toHaveLength(1);
+    // one `/language-models` probe + one `/models` fallback; the second call is served from cache.
+    expect((global.fetch as jest.Mock).mock.calls).toHaveLength(2);
+  });
+
+  it('listModels() prefers /language-models and never calls /models when the provider has it', async () => {
+    global.fetch = catalogFetch({
+      languageModels: { models: [{ id: 'grok-4.6', output_modalities: ['text'] }] },
+    }) as never;
+    const c = client();
+    expect(await c.listModels()).toEqual([{ id: 'grok-4.6' }]);
+    const urls = (global.fetch as jest.Mock).mock.calls.map(([u]) => u as string);
+    expect(urls).toEqual(['https://api.x.ai/v1/language-models']);
+  });
+
+  it('listModels() drops models the provider declares as non-text', async () => {
+    global.fetch = catalogFetch({
+      languageModels: {
+        models: [
+          { id: 'grok-4.6', output_modalities: ['text'] },
+          { id: 'grok-imagine-image', output_modalities: ['image'] },
+          { id: 'grok-imagine-video', output_modalities: ['video'] },
+        ],
+      },
+    }) as never;
+    expect((await client().listModels()).map(m => m.id)).toEqual(['grok-4.6']);
+  });
+
+  it('listModels() keeps models that declare no modalities at all (Ollama / LM Studio)', async () => {
+    // A self-hosted catalog publishes neither modalities nor prices. Dropping these would leave
+    // every self-hosted operator with an empty model list.
+    global.fetch = catalogFetch({ models: { data: [{ id: 'llama3.2' }, { id: 'qwen2.5' }] } }) as never;
+    expect((await client({ baseUrl: 'http://localhost:11434/v1' }).listModels()).map(m => m.id)).toEqual([
+      'llama3.2',
+      'qwen2.5',
+    ]);
+  });
+
+  it('listModels() filters a mixed /models catalog on declared modalities', async () => {
+    global.fetch = catalogFetch({
+      models: {
+        data: [
+          { id: 'chat-a', output_modalities: ['text'] },
+          { id: 'draw-b', output_modalities: ['image'] },
+          { id: 'bare-c' },
+        ],
+      },
+    }) as never;
+    expect((await client().listModels()).map(m => m.id)).toEqual(['chat-a', 'bare-c']);
+  });
+
+  it('a missing /language-models endpoint does not count toward the circuit breaker', async () => {
+    global.fetch = catalogFetch({ models: { data: [{ id: 'a' }] } }) as never;
+    const c = client({ failureThreshold: 1 });
+    await c.listModels();
+    expect(c.isHealthy()).toBe(true);
+  });
+
+  it('a 404 on /language-models is probed only once per client', async () => {
+    global.fetch = catalogFetch({ models: { data: [{ id: 'a' }] } }) as never;
+    const c = client({ catalogTtlMs: 0 });
+    await c.listModels();
+    await c.listModels();
+    const urls = (global.fetch as jest.Mock).mock.calls.map(([u]) => u as string);
+    expect(urls.filter(u => u.endsWith('/language-models'))).toHaveLength(1);
+    expect(urls.filter(u => u.endsWith('/models'))).toHaveLength(2);
   });
 
   it('setModel() changes the model on the next request', async () => {

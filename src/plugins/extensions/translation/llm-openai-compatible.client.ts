@@ -23,7 +23,7 @@ export const SYSTEM_PROMPT = [
   'You are a faithful, uncensored translation engine inside a private group chat.',
   'Preserve meaning, tone, register, slang, profanity, and sexual or adult content exactly as written. Never soften, censor, moralize, add warnings, or refuse.',
   'Never add commentary, notes, or explanations.',
-  'Names listed in "glossary" are people in the chat: copy them verbatim; never translate or transliterate them.',
+  'Names listed in "glossary" are people in the chat: copy them verbatim, in their original Latin spelling, even when the target language uses a different script such as Cyrillic, Chinese, Japanese or Arabic. Rendering a glossary name in the target script is transliteration and counts as a violation; never translate or transliterate them.',
   '"history" is prior conversation, oldest first, for context only. Do not translate it and do not include it in the output.',
   'Determine the language of "text". If it is one of "candidateLangs", answer with that code; otherwise answer with its true ISO 639-1 code. "hintLang" is the sender\'s usual language; prefer it when the text is ambiguous.',
   'Output ONLY a JSON object of the form {"source":"<code>","translations":{"<code>":"<translated text>"}} with one entry for every code in "candidateLangs" except "source". If "candidateLangs" is empty, "translations" is {}.',
@@ -148,6 +148,8 @@ export class OpenAiCompatibleClient implements ContextualTranslator, ModelSwitch
   private openUntil = 0;
   private catalog: ModelInfo[] | null = null;
   private catalogExpires = 0;
+  /** null = not probed yet, false = provider answered 404/405 for `/language-models`. */
+  private languageModelsSupported: boolean | null = null;
 
   constructor(private readonly opts: OpenAiCompatibleOptions) {
     this.base = opts.baseUrl.replace(/\/+$/, '');
@@ -210,13 +212,70 @@ export class OpenAiCompatibleClient implements ContextualTranslator, ModelSwitch
     return { detected: source, source, translations, provider: this.name };
   }
 
+  /**
+   * Text-chat models only. A model that cannot answer `/chat/completions` must never reach the
+   * catalog: the `model switch` command validates an id purely by catalog membership, so an
+   * image or video model offered here is accepted, persisted, and breaks every later translation.
+   */
   async listModels(): Promise<ModelInfo[]> {
     if (this.catalog && Date.now() < this.catalogExpires) return this.catalog;
-    const data = (await this.request('/models', 'GET')) as { data?: Array<Record<string, unknown>> };
-    const models = (data.data ?? []).filter(m => typeof m.id === 'string').map(toModelInfo);
+    const entries = await this.fetchCatalogEntries();
+    const models = entries
+      .filter(m => typeof m.id === 'string')
+      .filter(isTextCapable)
+      .map(toModelInfo);
     this.catalog = models;
     this.catalogExpires = Date.now() + this.catalogTtlMs;
     return models;
+  }
+
+  /**
+   * xAI's OpenAI-compatible `/models` publishes no modality metadata at all — chat, image and
+   * video models are indistinguishable there, and the video entries carry literally nothing but
+   * an id. Its `/language-models` sibling declares `output_modalities` and lists only chat
+   * models, so we prefer it when the provider has it and fall back to `/models` otherwise.
+   * Probed at most once per client instance (OpenAI answers 404; so do Ollama and LM Studio).
+   */
+  private async fetchCatalogEntries(): Promise<Array<Record<string, unknown>>> {
+    if (this.languageModelsSupported !== false) {
+      const rich = await this.probeLanguageModels();
+      if (rich) {
+        this.languageModelsSupported = true;
+        return rich;
+      }
+    }
+    const data = (await this.request('/models', 'GET')) as { data?: Array<Record<string, unknown>> };
+    return data.data ?? [];
+  }
+
+  /**
+   * Deliberately bypasses `request()`: a provider that simply does not have this endpoint is a
+   * normal answer, not an outage, and must never count toward the circuit breaker. Only a
+   * definitive 404/405 latches the "unsupported" flag — any other status or a transport error
+   * falls through to `/models` for this call and leaves the probe to be retried later.
+   */
+  private async probeLanguageModels(): Promise<Array<Record<string, unknown>> | null> {
+    if (Date.now() < this.openUntil) return null; // circuit open: let `request()` raise as usual
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.opts.timeoutMs);
+    try {
+      const res = await fetch(`${this.base}/language-models`, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.opts.apiKey}` },
+        signal: controller.signal,
+      });
+      if (res.status === 404 || res.status === 405) {
+        this.languageModelsSupported = false;
+        return null;
+      }
+      if (!res.ok) return null;
+      const json = (await res.json()) as { models?: Array<Record<string, unknown>> };
+      return Array.isArray(json.models) ? json.models : null;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async request(path: string, method: 'GET' | 'POST', body?: unknown): Promise<unknown> {
@@ -304,6 +363,22 @@ export function parseModelJson(content: string): { source: unknown; translations
     throw new Error('LLM returned non-JSON content');
   }
   return parsed as { source: unknown; translations: unknown };
+}
+
+/**
+ * Keep a model unless the provider positively declares it cannot emit text.
+ *
+ * The filter is deliberately NOT based on the presence of pricing fields: this client also
+ * targets Ollama and LM Studio, which publish no prices at all, so a price-based rule would
+ * empty the catalog for every self-hosted user. It is equally not based on an id pattern —
+ * `grok-imagine-*` is excluded because xAI declares `output_modalities: ["image"]` for it, not
+ * because of its name. A model that declares no modalities is kept, since silently dropping
+ * every un-annotated model would be a worse bug than the one this guards against.
+ */
+function isTextCapable(m: Record<string, unknown>): boolean {
+  const declared = m.output_modalities;
+  if (!Array.isArray(declared)) return true;
+  return declared.some(x => typeof x === 'string' && x.toLowerCase() === 'text');
 }
 
 function toModelInfo(m: Record<string, unknown>): ModelInfo {

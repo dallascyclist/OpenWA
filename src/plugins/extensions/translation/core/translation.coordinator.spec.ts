@@ -827,6 +827,27 @@ describe('TranslationCoordinator', () => {
       expect(out).toContain('grok-b');
     });
 
+    it('refuses a non-text model the provider filtered out of the catalog', async () => {
+      // `listModels()` now returns text-capable models only, so an image/video id is simply not a
+      // catalog member and falls through the existing unknown-model path. Guards the foot-gun where
+      // `/tr model switch grok-imagine-video` was accepted, persisted, and broke every translation.
+      const { c, mocks, save, current } = modelDeps(['111@c.us']);
+      await c.handleMessage('s', msg({ body: '/tr model switch grok-imagine-video' }));
+      expect(current()).toBe('grok-a');
+      expect(save).not.toHaveBeenCalled();
+      const out = (mocks.sendText.mock.calls as unknown[][])[mocks.sendText.mock.calls.length - 1][2] as string;
+      expect(out).toMatch(/Unknown model "grok-imagine-video"/);
+      // The nearest-match hint draws from the filtered catalog, so it cannot suggest an image model.
+      expect(out).toContain('Use /tr model list.');
+    });
+
+    it('never offers a non-text model in the list', async () => {
+      const { c, mocks } = modelDeps(['111@c.us']);
+      await c.handleMessage('s', msg({ body: '/tr model list' }));
+      const out = (mocks.sendText.mock.calls as unknown[][])[mocks.sendText.mock.calls.length - 1][2] as string;
+      expect(out).not.toContain('imagine');
+    });
+
     it('switches unverified when the catalog is unavailable', async () => {
       const { c, mocks, listModels, current } = modelDeps(['111@c.us']);
       listModels.mockRejectedValue(new Error('HTTP 500'));
