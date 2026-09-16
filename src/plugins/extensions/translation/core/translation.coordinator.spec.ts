@@ -15,6 +15,16 @@ import { ConversationContext } from './conversation-context';
 
 const OPTS: CoordinatorOptions = { prefix: '/tr', minLength: 2, maxLength: 2000, denyReply: false };
 
+/**
+ * A chain that actually has an external provider in it. The cloud disclosure requires this as well
+ * as cloud privacy mode, so any fixture exercising the disclosure has to declare it; the default
+ * `providerHealth` derives from the translator fake, which is `external: false` in these tests.
+ */
+const CLOUD_CHAIN = () => [
+  { name: 'llm', external: true, healthy: true },
+  { name: 'libretranslate', external: false, healthy: true },
+];
+
 function freshState(over: Partial<GroupState> = {}): GroupState {
   return {
     sessionId: 's',
@@ -646,7 +656,9 @@ describe('TranslationCoordinator', () => {
       const state = freshState({ announced: true });
       const { store, gateway, translator, saved, mocks } = makeDeps(state);
       mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
-      const c = new TranslationCoordinator(translator, store, gateway, OPTS);
+      const c = new TranslationCoordinator(translator, store, gateway, OPTS, undefined, {
+        providerHealth: CLOUD_CHAIN,
+      });
       await c.handleMessage('s', msg({ body: '/tr on' }));
       const disclosures = () =>
         (mocks.sendText.mock.calls as unknown[][]).filter(call => /external AI/i.test(call[2] as string));
@@ -660,7 +672,9 @@ describe('TranslationCoordinator', () => {
       const state = freshState({ announced: true, privacy: 'local' });
       const { store, gateway, translator, mocks } = makeDeps(state);
       mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
-      const c = new TranslationCoordinator(translator, store, gateway, OPTS);
+      const c = new TranslationCoordinator(translator, store, gateway, OPTS, undefined, {
+        providerHealth: CLOUD_CHAIN,
+      });
       const disclosures = () =>
         (mocks.sendText.mock.calls as unknown[][]).filter(call => /external AI/i.test(call[2] as string));
       await c.handleMessage('s', msg({ body: '/tr on' }));
@@ -879,7 +893,12 @@ describe('TranslationCoordinator', () => {
         languages: deps.mocks.languages,
         isHealthy: () => true,
       };
-      const c = new TranslationCoordinator(fake, deps.store, deps.gateway, OPTS, undefined, deps.extras);
+      // The mocked result claims `provider: 'llm'`, so the chain this fixture stands for has an
+      // external provider in it; the disclosure now requires that to be declared.
+      const c = new TranslationCoordinator(fake, deps.store, deps.gateway, OPTS, undefined, {
+        ...deps.extras,
+        providerHealth: CLOUD_CHAIN,
+      });
       const disclosures = () =>
         (deps.mocks.sendText.mock.calls as unknown[][]).filter(call => /external AI/i.test(call[2] as string));
       return { c, translateAll, disclosures, mocks: deps.mocks, saved: deps.saved };
@@ -930,6 +949,79 @@ describe('TranslationCoordinator', () => {
       expect(disclosures()).toHaveLength(2); // the failed attempt plus the retry
       expect(state.privacyDisclosed).toBe(true);
       expect(saved[saved.length - 1].privacyDisclosed).toBe(true);
+    });
+  });
+
+  // The disclosure is a compliance statement ("your messages may go to an external AI service"). It
+  // must track what the chain can actually do, not just the group's privacy mode: with `llmEnabled`
+  // false the chain holds LibreTranslate alone, and a cloud-mode group would otherwise be told its
+  // messages leave the instance when nothing external exists to send them to.
+  describe('disclosure is gated on an external provider being present', () => {
+    const LOCAL_ONLY = () => [{ name: 'libretranslate', external: false, healthy: true }];
+    const WITH_EXTERNAL = () => [
+      { name: 'llm', external: true, healthy: true },
+      { name: 'libretranslate', external: false, healthy: true },
+    ];
+
+    const cloudActive = () =>
+      freshState({
+        active: true,
+        announced: true,
+        participants: {
+          '111@c.us': { lang: 'es', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+          '222@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+        },
+      });
+
+    function deps(state: GroupState, providerHealth: () => ReturnType<typeof LOCAL_ONLY>) {
+      const d = makeDeps(state);
+      const translateAll = jest.fn().mockResolvedValue({
+        detected: 'es',
+        source: 'es',
+        translations: [{ lang: 'en', text: 'hi' }],
+        provider: 'llm',
+      });
+      const fake: ContextualTranslator = {
+        name: 'chain',
+        external: false,
+        translateAll,
+        languages: d.mocks.languages,
+        isHealthy: () => true,
+      };
+      d.mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
+      const c = new TranslationCoordinator(fake, d.store, d.gateway, OPTS, undefined, {
+        ...d.extras,
+        providerHealth,
+      });
+      const disclosures = () =>
+        (d.mocks.sendText.mock.calls as unknown[][]).filter(call => /external AI/i.test(call[2] as string));
+      return { c, disclosures };
+    }
+
+    it('says nothing to a cloud-mode group when the chain is LibreTranslate-only (/tr on)', async () => {
+      const { c, disclosures } = deps(freshState({ announced: true }), LOCAL_ONLY);
+      await c.handleMessage('s', msg({ body: '/tr on' }));
+      expect(disclosures()).toHaveLength(0);
+    });
+
+    it('says nothing to a cloud-mode group when the chain is LibreTranslate-only (translate path)', async () => {
+      const { c, disclosures } = deps(cloudActive(), LOCAL_ONLY);
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      expect(disclosures()).toHaveLength(0);
+    });
+
+    it('discloses exactly once once an external provider is in the chain (/tr on)', async () => {
+      const { c, disclosures } = deps(freshState({ announced: true }), WITH_EXTERNAL);
+      await c.handleMessage('s', msg({ body: '/tr on' }));
+      expect(disclosures()).toHaveLength(1);
+    });
+
+    it('discloses exactly once once an external provider is in the chain (translate path)', async () => {
+      const { c, disclosures } = deps(cloudActive(), WITH_EXTERNAL);
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      expect(disclosures()).toHaveLength(1);
+      await c.handleMessage('s', msg({ body: 'hola otra' }));
+      expect(disclosures()).toHaveLength(1);
     });
   });
 

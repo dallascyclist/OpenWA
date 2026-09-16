@@ -153,6 +153,35 @@ describe('TranslationPlugin wiring', () => {
       expect(retainedContext(plugin).get('s1', 'g1')).toEqual([]);
     });
 
+    it('is rebuilt when contextTurns changes, so the new limit actually takes effect', async () => {
+      // `maxTurns` is fixed at construction, so without a rebuild a dashboard edit would be inert
+      // until someone toggled the plugin.
+      const plugin = new TranslationPlugin();
+      await plugin.onEnable(makeContext({ contextTurns: 10 }));
+      retainedContext(plugin).append('s1', 'g1', turn('stale'));
+
+      await plugin.onConfigChange(makeContext({ contextTurns: 1 }));
+
+      expect(retainedContext(plugin).get('s1', 'g1')).toEqual([]);
+      retainedContext(plugin).append('s1', 'g1', turn('one'));
+      retainedContext(plugin).append('s1', 'g1', turn('two'));
+      expect(
+        retainedContext(plugin)
+          .get('s1', 'g1')
+          .map(t => t.text),
+      ).toEqual(['two']);
+    });
+
+    it('is kept when contextTurns is unchanged', async () => {
+      const plugin = new TranslationPlugin();
+      await plugin.onEnable(makeContext({ contextTurns: 5 }));
+      retainedContext(plugin).append('s1', 'g1', turn('remembered'));
+
+      await plugin.onConfigChange(makeContext({ contextTurns: 5, libretranslateUrl: 'http://b:5000' }));
+
+      expect(retainedContext(plugin).get('s1', 'g1')).toHaveLength(1);
+    });
+
     it('hands the coordinator the same context instance the plugin retains', async () => {
       const plugin = new TranslationPlugin();
       await plugin.onEnable(makeContext({}));

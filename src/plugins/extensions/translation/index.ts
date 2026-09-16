@@ -67,6 +67,8 @@ export class TranslationPlugin implements IPlugin {
   private context: ConversationContext | null = null;
   /** Instance default privacy the retained `context` was gathered under; see `shouldResetContext`. */
   private defaultPrivacy: PrivacyMode | undefined;
+  /** `contextTurns` the retained `context` was built with; a change forces a rebuild. */
+  private contextTurns: number | undefined;
 
   async onEnable(context: PluginContext): Promise<void> {
     this.coordinator = await this.buildCoordinator(context);
@@ -131,8 +133,22 @@ export class TranslationPlugin implements IPlugin {
     }
     this.defaultPrivacy = defaultPrivacy;
 
+    // `maxTurns` is fixed when the buffer is constructed, so a changed `contextTurns` only takes
+    // effect on a new instance. Without this the dashboard field would do nothing until someone
+    // disabled and re-enabled the plugin. Losing the buffered history is the accepted cost, and is
+    // how the buffer is treated at every other config-driven reset.
+    const contextTurns = readNumber(cfg, 'contextTurns', 10);
+    if (this.context && this.contextTurns !== contextTurns) {
+      this.context = null;
+      context.logger.log('Conversation context rebuilt: contextTurns changed', {
+        action: 'translation_context_rebuilt_turns',
+        contextTurns,
+      });
+    }
+    this.contextTurns = contextTurns;
+
     if (!this.context) {
-      this.context = new ConversationContext({ maxTurns: readNumber(cfg, 'contextTurns', 10), maxChars: 2000 });
+      this.context = new ConversationContext({ maxTurns: contextTurns, maxChars: 2000 });
     }
 
     const store = new PluginConfigStore(context.storage);
@@ -159,6 +175,7 @@ export class TranslationPlugin implements IPlugin {
     this.coordinator = null;
     this.context = null;
     this.defaultPrivacy = undefined;
+    this.contextTurns = undefined;
     context.logger.log('Translation plugin disabled', { action: 'translation_disabled' });
     return Promise.resolve();
   }

@@ -521,6 +521,14 @@ export class TranslationCoordinator {
   /**
    * Post the cloud disclosure once per group, only when cloud translation is in effect (spec §10).
    *
+   * Two conditions, not one. Cloud privacy mode alone is not enough: the disclosure is a compliance
+   * statement that messages may be sent to an external AI service, and the chain only contains an
+   * external provider when the operator has enabled one (`llmEnabled` plus an API key). With the
+   * shipped default the chain is LibreTranslate alone, and a cloud-mode group — which is every group,
+   * since `defaultPrivacy` is `cloud` — would otherwise be told its messages leave the instance when
+   * nothing external exists to send them to. A false compliance statement is worse than none, so the
+   * notice tracks what the chain can actually do.
+   *
    * Ordering: send FIRST, then mark the group disclosed and persist. This is deliberately the
    * opposite of `maybeNotifyHealth`, and the two must not be "made consistent" with each other.
    * This is a compliance notice, so the failure to err away from is under-disclosing: persisting
@@ -530,6 +538,7 @@ export class TranslationCoordinator {
    */
   private async discloseIfNeeded(sessionId: string, state: GroupState): Promise<void> {
     if (state.privacyDisclosed || this.effectivePrivacy(state).mode !== 'cloud') return;
+    if (!this.providerHealth().some(p => p.external)) return;
     await this.gateway.sendText(sessionId, state.chatId, buildDisclosureText(this.opts.prefix));
     state.privacyDisclosed = true;
     await this.store.save(state);
