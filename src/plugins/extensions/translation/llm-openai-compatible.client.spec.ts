@@ -153,6 +153,55 @@ describe('OpenAiCompatibleClient', () => {
     expect(langs).toEqual(expect.arrayContaining(['en', 'es', 'ru', 'zh']));
     expect(langs.length).toBeGreaterThan(40);
   });
+
+  it('listModels() parses the OpenAI shape without prices', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ object: 'list', data: [{ id: 'gpt-x', object: 'model' }] }),
+    }) as never;
+    const c = client({ baseUrl: 'https://api.openai.com/v1' });
+    expect(await c.listModels()).toEqual([{ id: 'gpt-x' }]);
+    const [url, init] = (global.fetch as jest.Mock).mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('https://api.openai.com/v1/models');
+    expect(init.method).toBe('GET');
+    expect(init.body).toBeUndefined();
+  });
+
+  it('listModels() converts xAI price fields to USD per 1M tokens', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () =>
+        Promise.resolve({
+          data: [{ id: 'grok-4.3', prompt_text_token_price: 12500, completion_text_token_price: 25000 }],
+        }),
+    }) as never;
+    expect(await client().listModels()).toEqual([{ id: 'grok-4.3', inputPerMTok: 1.25, outputPerMTok: 2.5 }]);
+  });
+
+  it('listModels() caches the catalog', async () => {
+    global.fetch = jest
+      .fn()
+      .mockResolvedValue({ ok: true, status: 200, json: () => Promise.resolve({ data: [{ id: 'a' }] }) }) as never;
+    const c = client();
+    await c.listModels();
+    await c.listModels();
+    expect((global.fetch as jest.Mock).mock.calls).toHaveLength(1);
+  });
+
+  it('setModel() changes the model on the next request', async () => {
+    const fetchMock = jest
+      .fn<Promise<unknown>, [string, RequestInit?]>()
+      .mockResolvedValue(completion('{"source":"es","translations":{"en":"hi","ru":"x"}}'));
+    global.fetch = fetchMock as never;
+    const c = client();
+    c.setModel('grok-4.6');
+    await c.translateAll(req());
+    const body = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string) as { model: string };
+    expect(body.model).toBe('grok-4.6');
+    expect(c.currentModel()).toBe('grok-4.6');
+  });
 });
 
 describe('parseModelJson', () => {
