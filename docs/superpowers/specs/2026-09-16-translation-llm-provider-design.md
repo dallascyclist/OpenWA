@@ -63,7 +63,7 @@ All new code lives under `src/plugins/extensions/translation/`. Existing files t
 translation/
   core/                          framework-free; no Nest/TypeORM/engine imports
     ports.ts                     (changed) + ContextualTranslator, TranslateRequest/Result, ContextTurn,
-                                 SummaryProvider (reserved), GroupState privacy fields, ProviderHealthListener
+                                 SummaryProvider (reserved), GroupState privacy fields, ProviderHealth
     translation.coordinator.ts   (changed) uses ContextualTranslator; privacy cmd; disclosure; degraded notices
     command.parser.ts            (changed) + `privacy [cloud|local]`, `model [list|switch <id>]`
     reply.formatter.ts           (changed) status shows providers, privacy, model; disclosure; notice; model list
@@ -148,7 +148,6 @@ export interface ModelSwitchable {
 export interface ProviderHealth { name: string; external: boolean; healthy: boolean }
 export interface ModelSelection { model: string; updatedAt: string; updatedBy: string }
 export interface ModelStore { load(): Promise<ModelSelection | null>; save(sel: ModelSelection): Promise<void> }
-export type ProviderHealthListener = (change: ProviderHealth) => void;
 
 // GroupState additions (persisted via ConfigStore):
 //   privacy?: 'cloud' | 'local'      undefined => use instance default
@@ -166,9 +165,16 @@ The existing `Translator` port stays for `LibreTranslateClient`; `LibreTranslate
 3. `result = await chain.translateAll(req)`. On throw (every provider failed): log, **append the turn to
    context with `lang = hintLang ?? 'und'`**, save state, return silently (matches today's "translator down"
    behaviour).
-4. `applyLearning(sender, result.source)` — unchanged debounce logic.
-5. `source = knownLangs.includes(result.source) ? result.source : (sender.lang ?? result.source)` — unchanged
-   sanity rule.
+4. `applyLearning(sender, result.detected)` — unchanged debounce logic.
+5. `source = knownLangs.includes(result.detected) ? result.detected : (sender.lang ?? result.detected)` —
+   unchanged sanity rule.
+
+   Steps 4-5 read `result.detected`, not `result.source`. The two fields differ by design (section 5):
+   `detected` is the raw detection, and `source` is the language that provider chose to translate *from*
+   after applying the same sanity rule to its own inputs. The coordinator must start from the raw value,
+   because participant learning is about what the sender actually wrote — feeding it the provider's
+   already-sanity-checked `source` would make learning self-confirming, since `source` collapses to the
+   sender's existing `hintLang` exactly when detection disagreed with it.
 6. `targets = targetLanguages(state, source, sender.lang)`; backstop rule unchanged. Keep only
    `result.translations` whose `lang` is in `targets`. If a target is missing from the result (LibreTranslate
    partial failure), log as today.
@@ -211,8 +217,19 @@ Response validation (any failure throws, which the chain treats as a provider fa
   accepted because LibreTranslate emits codes like `zh-Hans`, which therefore reach the model in
   `candidateLangs` and come back as `source`; rejecting them would silently exclude Chinese-authored
   messages from the LLM path. The check still rejects prose such as `"Spanish"`.
+- **A validated `source` is then canonicalized back to the group's own spelling** before anything downstream
+  sees it: if some `candidateLangs` entry matches case-insensitively, that entry's spelling is returned; a
+  code with no case-insensitive match is a language the group does not speak yet and is passed through
+  untouched. This is a correctness requirement, not tidiness. Accepting subtags case-insensitively (previous
+  bullet) means the model can legitimately answer `zh-hans` where the group holds `zh-Hans`. Left as-is that
+  drifted spelling flows into `detected`, participant learning persists it as a *second* language for that
+  sender, and from then on the group's known-language set contains both spellings — so every later message is
+  translated twice, once per spelling, in every reply.
 - `translations` is an object containing **every** required target (`candidateLangs` minus `source`) with a
   non-empty string. A missing target is treated as a refusal, since that is how refusals surface in practice.
+  **Each target is looked up exact-match first, then case-insensitively** over the returned object's keys, for
+  the same reason: a model that echoes the key `zh-hans` for a `zh-Hans` target has answered correctly, and
+  without the fallback it would be miscounted as a refusal and fail the whole chain down to LibreTranslate.
 - Content that matches common refusal phrasing where JSON was expected (e.g. "I can't", "I'm sorry") throws
   a distinguishable `ProviderRefusedError` so logs can count refusals separately from outages.
 
@@ -229,10 +246,30 @@ Model switching (`ModelSwitchable`):
   numeric fields are present, divide by **10000** to get USD per 1M tokens (verified live 2026-09-16:
   `12500` => USD 1.25). Providers without those fields yield `ModelInfo` with no price fields. Cached for
   10 minutes to keep `/tr model list` cheap.
+- **The catalog is filtered to text-capable models.** `/models` returns image and video models alongside
+  chat ones, and `setModel` deliberately does not validate (previous bullet) — the coordinator's only check
+  is catalog membership, so an image model that reaches the list is a model an operator can switch to,
+  persist, and thereby break every subsequent translation until someone switches back. Because xAI's
+  `/models` publishes no modality metadata at all, the client first probes its `/language-models` sibling,
+  which declares `output_modalities` and lists only chat models, and falls back to `/models` when that
+  endpoint is absent. The probe is attempted at most once per client instance and only a definitive 404/405
+  latches "unsupported"; it bypasses the circuit breaker, since a provider that simply lacks the endpoint is
+  answering normally, not failing.
+- The filter keeps a model **unless the provider positively declares it cannot emit text** — a model that
+  declares no modalities is kept. Ollama and LM Studio annotate nothing, so dropping un-annotated models
+  would empty the catalog for every self-hosted user, which is a worse failure than the one being guarded
+  against. Filtering on the presence of pricing fields would be wrong for exactly the same reason: those
+  providers publish no prices either. Nor is the filter id-pattern-based — `grok-imagine-*` is excluded
+  because xAI declares `output_modalities: ["image"]` for it, not because of its name.
 
 ## 8. Fallback chain (core/fallback-chain.ts)
 
-`new FallbackChain(providers: ContextualTranslator[], onHealth?: ProviderHealthListener)`
+`new FallbackChain(providers: ContextualTranslator[], logger?: TranslationLogger)`
+
+The second argument is the logger for the per-provider failure line below, not a health callback. An earlier
+draft of this section passed an `onHealth?: ProviderHealthListener` push callback; that type was never built
+and has been dropped from section 5. The polling model described at the end of this section is the
+authoritative one.
 
 `translateAll(req)`:
 - Iterate providers in order. Skip if `provider.external && !req.allowExternal`. Do **not** skip on
@@ -256,9 +293,16 @@ push listener is needed.
 `maxChars = 2000` (fixed; not user-facing in this cut). The char cap evicts oldest-first but always keeps at
 least the newest turn, so a single long message does not empty the buffer.
 
+`maxTurns` is **clamped to at least 1** (non-finite values also fall back to 1). This is a liveness
+requirement, not cosmetics: the turn cap is enforced by `while (buf.length > maxTurns) buf.shift()`, and for
+any non-positive `maxTurns` that condition never becomes false once the buffer is empty, so the loop spins
+forever. `contextTurns` is an operator-editable dashboard field, so a `0` or a stray `-1` is reachable without
+touching code, and the loop runs on the synchronous message-handling path — it would block the event loop for
+the whole process, taking down every session on the instance, not just translation in one group.
+
 - `get(sessionId, chatId): ContextTurn[]` — oldest first.
 - `append(sessionId, chatId, turn)` — drop oldest until both caps hold.
-- `clear(sessionId, chatId)` — called on `/tr off`.
+- `clear(sessionId, chatId)` — called on `/tr off`, and on every `/tr privacy` switch (section 10).
 - Keyed `${sessionId}:${chatId}`; plain `Map`. No persistence. No eviction of idle chats in this cut
   (bounded by maxTurns x groups; revisit if memory ever matters).
 
@@ -272,10 +316,33 @@ What never enters: commands, the bot's own sends, messages below `minLength`, UR
 - `effectivePrivacy(state) = state.privacy ?? defaultPrivacy`.
 - `/tr privacy` (anyone): replies with the effective mode, whether it is a group override or the instance
   default, and the disclosure text.
-- `/tr privacy cloud|local` (admin/delegate-gated like `on`/`off`): sets `state.privacy`, confirms, and if the
-  new mode is cloud and `!privacyDisclosed`, posts the disclosure and sets `privacyDisclosed = true`.
+- `/tr privacy cloud|local` (admin/delegate-gated like `on`/`off`): sets `state.privacy`, **clears that
+  group's conversation buffer**, confirms, and if the new mode is cloud and `!privacyDisclosed`, posts the
+  disclosure and sets `privacyDisclosed = true`.
 - `/tr on`: after the existing confirmation, if effective mode is cloud and `!privacyDisclosed`, post the
   disclosure and set the flag.
+- **The buffer is cleared on any privacy switch.** Going local -> cloud is the point: the retained turns were
+  spoken while the group had explicitly opted out of external processing, and without the clear they would
+  ship to the external provider as `history` on the very next message. The disclosure does not retroactively
+  cover them — it says message text *will be* sent, not that already-spoken text is about to be. The clear is
+  unconditional rather than only on the flip to cloud, because dropping history on cloud -> local costs
+  nothing and leaves no branch here for a later change to get wrong.
+- The same boundary exists one level up, at the instance default: flipping config `defaultPrivacy` from
+  `local` to `cloud` makes every group without an override cloud-eligible, so that transition drops the
+  retained context wholesale (`core/privacy-transition.ts`, applied when the coordinator is rebuilt). The
+  first build of the plugin's lifetime has no prior mode and therefore no retained context to leak, so it
+  resets nothing.
+- **The disclosure requires two conditions, not one: `mode === 'cloud'` AND the chain actually contains an
+  external provider.** Cloud privacy mode alone is not sufficient. The disclosure is a compliance statement
+  that message text may be sent to an external AI service, and that is only true once the operator has wired
+  one up (`llmEnabled` plus a usable API key). On the default-but-unconfigured deployment — `defaultPrivacy`
+  is `'cloud'`, `llmEnabled` is false — the chain holds LibreTranslate alone, nothing leaves the instance,
+  and posting the notice would tell every group their messages go to an external service when none exists. A
+  false compliance statement is worse than no statement, so the check is on the chain's composition
+  (`providerHealth().some(p => p.external)`), not on config or on privacy mode alone.
+- Ordering: the disclosure is sent **first**, then `privacyDisclosed` is persisted. A send failure therefore
+  leaves the flag unset and the notice is retried, erring toward disclosing twice rather than translating
+  externally having never disclosed once.
 - Disclosure text (formatter; wording may be refined): "ℹ️ Translations in this group are produced by an
   external AI service; message text is sent to that provider for translation. An admin can switch to
   local-only translation with `/tr privacy local`."
@@ -285,10 +352,10 @@ What never enters: commands, the bot's own sends, messages below `minLength`, UR
 
 ## 11. Degraded and recovered notices
 
-- Coordinator keeps two in-memory maps: `currentHealth: Map<providerName, boolean>` (updated by the
-  chain's health listener) and `notifiedHealth: Map<chatKey, Map<providerName, boolean>>` (what each group
+- Coordinator polls `chain.providerHealth()` for current state — there is no push listener (section 8) — and
+  keeps one in-memory map, `notifiedHealth: Map<chatKey, Map<providerName, boolean>>` (what each group
   was last told). Nothing is persisted and no storage enumeration happens.
-- On each group's next translated message, compare `currentHealth` against that group's `notifiedHealth`;
+- On each group's next translated message, compare the polled health against that group's `notifiedHealth`;
   for every provider whose state differs, post one notice line and record it. Result: at most one line per
   provider per transition per group, delivered lazily on that group's next activity.
 - Notice text: degraded "⚠️ AI translation is temporarily unavailable; using basic translation until it
@@ -306,7 +373,9 @@ sufficient, this is an instance-level control):
 - `/tr model list` — call `listModels()` and post one line per model: `id`, then `in $X / out $Y per 1M tok`
   when pricing is available, with the active model marked. Truncate to the first 30 entries with a
   "(+N more)" trailer so a large OpenAI catalog cannot flood the group.
-- `/tr model switch <id>` — validate `<id>` against `listModels()` (case-sensitive exact match); on hit call
+- `/tr model switch <id>` — validate `<id>` against `listModels()` (case-sensitive exact match; note that
+  catalog is filtered to text-capable models, section 7, which is what keeps an image or video model from
+  being switchable at all); on hit call
   `setModel(id)`, persist via `ModelStore`, and confirm. On miss reply with the nearest few ids (simple
   prefix/substring match) and do nothing. If the catalog call fails, allow the switch anyway with a
   "catalog unavailable, switched unverified" confirmation, since the next translation will reveal a bad id
@@ -402,7 +471,9 @@ Update `CLAUDE.md` "Managing the VM stack" with the new secret file and config k
 - **Reviewer: Fable** (Claude Fable 5.1) reviews after **every task** (spec conformance + code quality) and
   once more at the end (whole-branch review, smoke test evidence, deployment checklist).
 - TDD per task: failing spec first, then implementation, then `npm test -- <spec>`; `npm run lint` and
-  `npm run format -- --check` before each review handoff.
+  `npx prettier --check "src/**/*.ts" "test/**/*.ts"` before each review handoff. (Not
+  `npm run format -- --check`: this repo defines `format` as `prettier --write`, so the appended flag does
+  not turn it into a check — it rewrites the files it was meant to verify.)
 
 ## 17. Future (out of scope, recorded so the shape is not lost)
 
@@ -412,3 +483,57 @@ Update `CLAUDE.md` "Managing the VM stack" with the new secret file and config k
 - Per-group model or provider override (commercial tiering); today's `/tr model switch` is instance-wide.
 - Idle-chat eviction for `ConversationContext`.
 - Persisting the disclosure/privacy policy version so a changed policy re-discloses.
+
+## 18. Known follow-ups
+
+Recorded at the end of implementation. None of these block the branch; all are things the next person should
+not have to rediscover.
+
+### Plugin config secrets are readable over the API (pre-existing, now higher-stakes)
+
+`GET /plugins` returns each plugin's `plugin.config` verbatim, so `llmApiKey` crosses to any caller permitted
+to list plugins, and reaches the dashboard in plaintext. The existing `secret: true` field-schema flag only
+changes the dashboard's *input* type; it does not mask the read path. This predates this branch — the branch
+just gave the translation plugin its first genuinely sensitive config value.
+
+The fix is more subtle than masking the response, because of a coupling: **the dashboard currently relies on
+the key being returned, so that it can re-post it when the operator saves an unrelated config field.** Mask
+the read path alone and the next config edit writes back a masked or empty `llmApiKey`, and the LLM silently
+drops out of the chain — the group keeps getting LibreTranslate output with no error anywhere. Whoever masks
+the read path must simultaneously teach the dashboard to *omit* an untouched secret from its PUT, and the
+backend to preserve the stored value when a secret key is absent from the payload.
+
+### Model output quality
+
+The hard requirement — no softening, no censoring, no refusal — held on every observed live run. What is not
+stable run-to-run is the *strength* of profanity at `temperature: 0.2`: identical input produced "so fucking
+hot" on one run and "so damn hot" on another. Recorded because faithful register is a product requirement
+here, so a drift toward euphemism is a real regression signal, not a cosmetic one. No action proposed.
+
+### Open question (unresolved — the project owner decides, not the implementer)
+
+The live model **transliterates glossary names into non-Latin target scripts** despite the system prompt's
+explicit never-transliterate rule: `Doug` comes back as `Даг` or `Дуг` in Russian. English and Chinese targets
+preserve the Latin spelling correctly. Two live runs against two different prompt wordings failed identically,
+so this is not a one-off sampling artifact and stronger prompt wording has already been tried once.
+
+The live smoke script exits 2 on the `keepsNameInEveryTarget` check by design, so the failure stays visible
+until this is decided. Three options are under consideration:
+
+1. Accept the behaviour and revert the strengthened prompt bullet, treating transliteration into a
+   non-Latin script as correct localization rather than a violation.
+2. Keep tuning the prompt (e.g. per-target instruction, or restating the glossary inside the user payload).
+3. Post-process deterministically: restore the Latin spelling of every glossary name in the output.
+
+### Deferred minors (worth a triage pass before merge)
+
+- `notifiedHealth` is never evicted. Bounded by groups seen since boot and cleared on restart, so it is a
+  slow leak at worst, but it is unbounded in principle.
+- The conversation buffer appends in *completion* order, not arrival order, when messages are handled
+  concurrently. Context can therefore be slightly out of order under load.
+- `translation/manifest.json` is stale but dead — the loader scans `./plugins`, not `src/`, so nothing reads
+  it. Delete it or update it; leaving it is a trap for the next reader.
+- `buildCoordinator` is long enough to want decomposing if it grows again.
+- `index.spec.ts` reaches private fields through casts.
+- The circuit-open path logs via `console.warn`, which makes test output non-pristine. The right fix is a
+  repo-level Jest setup file, not per-spec console spies — so it is deliberately not fixed locally here.
