@@ -741,4 +741,108 @@ describe('TranslationCoordinator', () => {
       expect(notices()).toEqual([]);
     });
   });
+
+  describe('model commands', () => {
+    function modelDeps(operatorWids: string[]) {
+      const deps = makeDeps(freshState({ announced: true }));
+      let model = 'grok-a';
+      const catalog = [
+        { id: 'grok-a', inputPerMTok: 1.25, outputPerMTok: 2.5 },
+        { id: 'grok-b', inputPerMTok: 2, outputPerMTok: 6 },
+      ];
+      const listModels = jest.fn().mockResolvedValue(catalog);
+      const models = { listModels, currentModel: () => model, setModel: (id: string) => void (model = id) };
+      const save = jest.fn().mockResolvedValue(undefined);
+      const modelStore = { load: jest.fn().mockResolvedValue(null), save };
+      const c = new TranslationCoordinator(
+        deps.translator,
+        deps.store,
+        deps.gateway,
+        { ...OPTS, operatorWids },
+        undefined,
+        {
+          ...deps.extras,
+          models,
+          modelStore,
+        },
+      );
+      return { c, mocks: deps.mocks, listModels, save, current: () => model };
+    }
+
+    it('denies non-operators, even group admins', async () => {
+      const { c, mocks } = modelDeps(['999@c.us']);
+      mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
+      await c.handleMessage('s', msg({ body: '/tr model list' }));
+      expect(mocks.sendText).toHaveBeenLastCalledWith(
+        's',
+        'g@g.us',
+        '⛔ Only the instance operator can use that command.',
+      );
+    });
+
+    it('shows the active model for an operator (device-suffixed author tolerated)', async () => {
+      const { c, mocks } = modelDeps(['111@c.us']);
+      await c.handleMessage('s', msg({ body: '/tr model', author: '111:7@c.us' }));
+      expect(mocks.sendText).toHaveBeenLastCalledWith('s', 'g@g.us', expect.stringContaining('grok-a'));
+    });
+
+    it('lists models with prices and the active marker', async () => {
+      const { c, mocks } = modelDeps(['111@c.us']);
+      await c.handleMessage('s', msg({ body: '/tr model list' }));
+      const out = (mocks.sendText.mock.calls as unknown[][])[mocks.sendText.mock.calls.length - 1][2] as string;
+      expect(out).toContain('▶ grok-a — in $1.25 / out $2.50 per 1M tok');
+      expect(out).toContain('• grok-b — in $2.00 / out $6.00 per 1M tok');
+    });
+
+    it('switches to a known model and persists it', async () => {
+      const { c, mocks, save, current } = modelDeps(['111@c.us']);
+      await c.handleMessage('s', msg({ body: '/tr model switch grok-b' }));
+      expect(current()).toBe('grok-b');
+      expect(save).toHaveBeenCalledWith(expect.objectContaining({ model: 'grok-b', updatedBy: '111@c.us' }));
+      expect(mocks.sendText).toHaveBeenLastCalledWith('s', 'g@g.us', '✅ Model switched to grok-b.');
+    });
+
+    it('rejects an unknown model with suggestions and does not switch', async () => {
+      const { c, mocks, save, current } = modelDeps(['111@c.us']);
+      await c.handleMessage('s', msg({ body: '/tr model switch grok' }));
+      expect(current()).toBe('grok-a');
+      expect(save).not.toHaveBeenCalled();
+      const out = (mocks.sendText.mock.calls as unknown[][])[mocks.sendText.mock.calls.length - 1][2] as string;
+      expect(out).toMatch(/Unknown model "grok"/);
+      expect(out).toContain('grok-a');
+      expect(out).toContain('grok-b');
+    });
+
+    it('switches unverified when the catalog is unavailable', async () => {
+      const { c, mocks, listModels, current } = modelDeps(['111@c.us']);
+      listModels.mockRejectedValue(new Error('HTTP 500'));
+      await c.handleMessage('s', msg({ body: '/tr model switch anything' }));
+      expect(current()).toBe('anything');
+      expect(mocks.sendText).toHaveBeenLastCalledWith('s', 'g@g.us', expect.stringMatching(/unverified/));
+    });
+
+    it('replies usage when switch has no id', async () => {
+      const { c, mocks } = modelDeps(['111@c.us']);
+      await c.handleMessage('s', msg({ body: '/tr model switch' }));
+      expect(mocks.sendText).toHaveBeenLastCalledWith(
+        's',
+        'g@g.us',
+        expect.stringContaining('Usage: /tr model switch <id>'),
+      );
+    });
+
+    it('reports not configured when there is no switchable provider', async () => {
+      const deps = makeDeps(freshState({ announced: true }));
+      const c = new TranslationCoordinator(deps.translator, deps.store, deps.gateway, {
+        ...OPTS,
+        operatorWids: ['111@c.us'],
+      });
+      await c.handleMessage('s', msg({ body: '/tr model' }));
+      expect(deps.mocks.sendText).toHaveBeenLastCalledWith(
+        's',
+        'g@g.us',
+        'AI translator is not configured on this instance.',
+      );
+    });
+  });
 });

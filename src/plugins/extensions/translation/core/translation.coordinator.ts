@@ -23,6 +23,7 @@ import {
   buildHelpText,
   formatCombinedReply,
   formatHealthNotice,
+  formatModelList,
   formatPrivacy,
   formatStatus,
 } from './reply.formatter';
@@ -380,6 +381,17 @@ export class TranslationCoordinator {
       await this.gateway.sendText(sessionId, msg.chatId, formatPrivacy(this.effectivePrivacy(state), this.opts.prefix));
       return;
     }
+    // `model` is instance-wide, not group-scoped: it answers to the operator allow-list only, so
+    // this gate deliberately sits BEFORE the group admin gate — a group admin is not an operator.
+    if (cmd.name === 'model') {
+      const isOperator = (this.opts.operatorWids ?? []).some(w => widEquals(w, msg.author));
+      if (!isOperator) {
+        await this.gateway.sendText(sessionId, msg.chatId, '⛔ Only the instance operator can use that command.');
+        return;
+      }
+      await this.handleModelCommand(sessionId, msg, cmd);
+      return;
+    }
 
     const targetsSelf = cmd.target?.kind === 'me';
     const isSelfServe = (cmd.name === 'setlang' || cmd.name === 'auto') && targetsSelf;
@@ -472,8 +484,6 @@ export class TranslationCoordinator {
         await this.discloseIfNeeded(sessionId, state);
         return;
       }
-      case 'model':
-        return; // implemented in a later task
     }
   }
 
@@ -483,6 +493,72 @@ export class TranslationCoordinator {
     state.privacyDisclosed = true;
     await this.store.save(state);
     await this.gateway.sendText(sessionId, state.chatId, buildDisclosureText(this.opts.prefix));
+  }
+
+  /** `/tr model [list|switch <id>]` — operator-only; the caller has already checked the allow-list. */
+  private async handleModelCommand(sessionId: string, msg: InboundMessage, cmd: ParsedCommand): Promise<void> {
+    const models = this.extras.models;
+    if (!models) {
+      await this.gateway.sendText(sessionId, msg.chatId, 'AI translator is not configured on this instance.');
+      return;
+    }
+    const action = cmd.modelAction ?? 'show';
+
+    if (action === 'show') {
+      await this.gateway.sendText(sessionId, msg.chatId, `🤖 Active model: ${models.currentModel()}`);
+      return;
+    }
+
+    if (action === 'list') {
+      try {
+        const catalog = await models.listModels();
+        await this.gateway.sendText(sessionId, msg.chatId, formatModelList(catalog, models.currentModel()));
+      } catch (err) {
+        this.logger.warn('model catalog unavailable', {
+          action: 'translation_model_catalog_failed',
+          error: String(err),
+        });
+        await this.replyError(sessionId, msg, '⚠️ Model catalog unavailable right now.');
+      }
+      return;
+    }
+
+    // switch
+    const id = cmd.modelId;
+    if (!id) return this.replyError(sessionId, msg, `Usage: ${this.opts.prefix} model switch <id>`);
+
+    // A null catalog means "could not verify", which is NOT the same as "not in the catalog":
+    // an unreachable provider must never turn a valid id into a rejection.
+    let catalog: string[] | null = null;
+    try {
+      catalog = (await models.listModels()).map(m => m.id);
+    } catch (err) {
+      this.logger.warn('model catalog unavailable; switching unverified', {
+        action: 'translation_model_catalog_failed',
+        error: String(err),
+      });
+    }
+    if (catalog && !catalog.includes(id)) {
+      const near = catalog.filter(m => m.includes(id) || id.includes(m)).slice(0, 5);
+      const hint = near.length > 0 ? `Did you mean: ${near.join(', ')}` : `Use ${this.opts.prefix} model list.`;
+      return this.replyError(sessionId, msg, `⚠️ Unknown model "${id}". ${hint}`);
+    }
+
+    models.setModel(id);
+    await this.extras.modelStore?.save({ model: id, updatedAt: new Date().toISOString(), updatedBy: msg.author });
+    this.logger.info('model switched', {
+      action: 'translation_model_switched',
+      model: id,
+      by: msg.author,
+      verified: catalog !== null,
+    });
+    await this.gateway.sendText(
+      sessionId,
+      msg.chatId,
+      catalog
+        ? `✅ Model switched to ${id}.`
+        : `✅ Model switched to ${id} (catalog unavailable, switched unverified).`,
+    );
   }
 
   private resolveTarget(msg: InboundMessage, target?: CommandTarget): string | null {
