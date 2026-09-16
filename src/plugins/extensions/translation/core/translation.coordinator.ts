@@ -66,7 +66,11 @@ function widEquals(a: string, b: string): boolean {
 export class TranslationCoordinator {
   private readonly context: ConversationContext;
   private readonly extras: CoordinatorExtras;
-  /** Per group: the provider health we last told that group about (spec §11). Not persisted. */
+  /**
+   * Per group: the provider health we last told that group about (spec §11). Not persisted — one
+   * entry per group seen since boot, dropped on restart, which is also what makes the
+   * first-sighting baseline in `maybeNotifyHealth` work.
+   */
   private readonly notifiedHealth = new Map<string, Map<string, boolean>>();
 
   constructor(
@@ -247,6 +251,13 @@ export class TranslationCoordinator {
    * Announce a provider health transition once per group, lazily on that group's next translated
    * message (spec §11). The first sighting of a group since boot only records a baseline, so a
    * restart never greets every group with a spurious "recovered" notice.
+   *
+   * Ordering: record the transition FIRST, then send. This is deliberately the opposite of
+   * `discloseIfNeeded`, and the two must not be "made consistent" with each other. This is a
+   * non-persisted convenience notice, so the failure to err away from is a repeat storm — every
+   * subsequent message re-announcing the same outage. Losing one notice to a failed send is cheap;
+   * the next transition still reports. `discloseIfNeeded` is a compliance notice and errs the other
+   * way. See its docblock.
    */
   private async maybeNotifyHealth(sessionId: string, state: GroupState): Promise<void> {
     const key = `${sessionId}:${state.chatId}`;
@@ -492,6 +503,14 @@ export class TranslationCoordinator {
       }
       case 'privacy': {
         state.privacy = cmd.privacy; // non-undefined here: the show form returned earlier
+        // Drop the buffered conversation: turns spoken under the previous privacy mode must not
+        // cross the boundary. Going local->cloud this is the whole point — the last ten turns were
+        // spoken while the group had explicitly opted out of external processing, and they would
+        // otherwise ship to the provider as `history` on the very next message. The disclosure does
+        // not cover them: it says messages *will be* sent, not that already-spoken ones are about
+        // to be. Cleared unconditionally rather than only on the flip to cloud: dropping history on
+        // cloud->local costs nothing and leaves no branch here to get wrong later.
+        this.context.clear(sessionId, msg.chatId);
         await this.confirm(sessionId, msg, `✅ Privacy set to ${cmd.privacy} for this group.`, state);
         await this.discloseIfNeeded(sessionId, state);
         return;
@@ -501,8 +520,13 @@ export class TranslationCoordinator {
 
   /**
    * Post the cloud disclosure once per group, only when cloud translation is in effect (spec §10).
-   * Send BEFORE marking the group disclosed: if the send fails the flag stays unset, so the next
-   * message retries. Persisting first would permanently silence a notice the group never received.
+   *
+   * Ordering: send FIRST, then mark the group disclosed and persist. This is deliberately the
+   * opposite of `maybeNotifyHealth`, and the two must not be "made consistent" with each other.
+   * This is a compliance notice, so the failure to err away from is under-disclosing: persisting
+   * first would let one failed send permanently silence a notice the group never received. Leaving
+   * the flag unset means the next message retries, at worst costing a duplicate. `maybeNotifyHealth`
+   * is a non-persisted convenience notice and errs the other way. See its docblock.
    */
   private async discloseIfNeeded(sessionId: string, state: GroupState): Promise<void> {
     if (state.privacyDisclosed || this.effectivePrivacy(state).mode !== 'cloud') return;

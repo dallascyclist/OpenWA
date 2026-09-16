@@ -821,6 +821,13 @@ describe('TranslationCoordinator', () => {
       expect(mocks.sendText).toHaveBeenLastCalledWith('s', 'g@g.us', expect.stringMatching(/unverified/));
     });
 
+    it('reports a catalog failure on list', async () => {
+      const { c, mocks, listModels } = modelDeps(['111@c.us']);
+      listModels.mockRejectedValue(new Error('HTTP 500'));
+      await c.handleMessage('s', msg({ body: '/tr model list' }));
+      expect(mocks.sendText).toHaveBeenLastCalledWith('s', 'g@g.us', '⚠️ Model catalog unavailable right now.');
+    });
+
     it('replies usage when switch has no id', async () => {
       const { c, mocks } = modelDeps(['111@c.us']);
       await c.handleMessage('s', msg({ body: '/tr model switch' }));
@@ -986,6 +993,67 @@ describe('TranslationCoordinator', () => {
       translateAll.mockRejectedValue(new Error('all providers down'));
       await c.handleMessage('s', msg({ body: 'hola otra' }));
       expect(notices()).toEqual([]);
+    });
+  });
+
+  describe('privacy switch and the conversation buffer', () => {
+    function bufferDeps(state: GroupState) {
+      const deps = makeDeps(state);
+      const translateAll = jest.fn().mockResolvedValue({
+        detected: 'es',
+        source: 'es',
+        translations: [{ lang: 'en', text: 'hi' }],
+        provider: 'libretranslate',
+      });
+      const fake: ContextualTranslator = {
+        name: 'chain',
+        external: false,
+        translateAll,
+        languages: deps.mocks.languages,
+        isHealthy: () => true,
+      };
+      const c = new TranslationCoordinator(fake, deps.store, deps.gateway, OPTS, undefined, deps.extras);
+      const requestAt = (i: number) => (translateAll.mock.calls as unknown[][])[i][0] as TranslateRequest;
+      return { c, requestAt, mocks: deps.mocks };
+    }
+    const localActive = () =>
+      freshState({
+        active: true,
+        announced: true,
+        privacy: 'local',
+        participants: {
+          '111@c.us': { lang: 'es', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+          '222@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+        },
+      });
+
+    it('does not ship the local-era history to the provider after switching to cloud', async () => {
+      const { c, requestAt, mocks } = bufferDeps(localActive());
+      mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      await c.handleMessage('s', msg({ body: 'que tal' }));
+      // Guard against a vacuous assertion: the buffer really did fill up while the group was local.
+      expect(requestAt(1).history.length).toBeGreaterThan(0);
+      expect(requestAt(1).allowExternal).toBe(false);
+
+      await c.handleMessage('s', msg({ body: '/tr privacy cloud' }));
+
+      await c.handleMessage('s', msg({ body: 'hello again' }));
+      expect(requestAt(2).allowExternal).toBe(true);
+      expect(requestAt(2).history).toEqual([]);
+    });
+
+    it('also clears the buffer on a cloud to local switch', async () => {
+      const { c, requestAt, mocks } = bufferDeps({ ...localActive(), privacy: 'cloud' });
+      mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      await c.handleMessage('s', msg({ body: 'que tal' }));
+      expect(requestAt(1).history.length).toBeGreaterThan(0);
+
+      await c.handleMessage('s', msg({ body: '/tr privacy local' }));
+
+      await c.handleMessage('s', msg({ body: 'hello again' }));
+      expect(requestAt(2).history).toEqual([]);
     });
   });
 });
