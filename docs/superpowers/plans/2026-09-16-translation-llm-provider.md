@@ -46,7 +46,8 @@
 | `src/plugins/extensions/translation/index.ts` | modify | Wires chain, context, stores, config keys |
 | `src/plugins/extensions/extensions.module.ts` | modify | `configSchema` entries for the new keys |
 | `scripts/translation-llm-smoke.ts` | create | Manual live check against the real provider |
-| `CLAUDE.md` | modify | VM ops notes for the new secret and config keys |
+| `docs/…/2026-09-16-translation-llm-provider-design.md` §15a | modify | VM ops notes for the new secret and config keys (tracked home) |
+| `CLAUDE.md` | modify | same notes, local convenience only — git-ignored, cannot be committed |
 
 ---
 
@@ -2814,11 +2815,19 @@ git commit -m "chore(translation): live smoke script for the LLM translator"
 **Intent:** Leave the repo and the ops notes in a state where the next person (or Fable) can deploy without re-deriving anything.
 
 **Files:**
-- Modify: `CLAUDE.md` (section "Deployment & operations" → "Managing the VM stack")
+- Modify: `docs/superpowers/specs/2026-09-16-translation-llm-provider-design.md` (§15a operational runbook — the *tracked* home for these notes, and the spec drift corrections)
+- Modify: `CLAUDE.md` (section "Deployment & operations" → "Managing the VM stack") — **git-ignored, local convenience only**
 
-- [ ] **Step 1: Update CLAUDE.md**
+> **Correction (found during execution):** `CLAUDE.md` is git-ignored at `.gitignore:75` and has never been
+> committed in this repo's history — it is grouped with `.claude/`, `.agent/` and `.remember/`, so being
+> untracked is deliberate machine-local policy. It therefore **cannot** be the home for deployment
+> knowledge, and it cannot be committed (see Step 3). The canonical copy of the operational notes below
+> lives in spec §15a. Updating the local `CLAUDE.md` as well is still worth doing for whoever works on
+> that machine.
 
-Add a bullet under "Managing the VM stack", after the LibreTranslate bullet:
+- [ ] **Step 1: Write the ops notes into spec §15a, and mirror them into the local CLAUDE.md**
+
+Under "Managing the VM stack", after the LibreTranslate bullet:
 
 ```markdown
 - AI translator (Grok via OpenAI-compatible API): primary provider since 2026-09, LibreTranslate is the fallback. Key lives at `/opt/openwa/secrets/xai.key` (root-only). `enable-plugin.sh` sets `llmEnabled`, `llmBaseUrl`, `llmModel`, `llmApiKey` (read from that file), `contextTurns`, `defaultPrivacy`, and `operatorWids` on every boot; the operator's runtime model choice (`/tr model switch`) is persisted separately in plugin storage and survives that re-PUT. Per-group opt-out: `/tr privacy local`. Design: `docs/superpowers/specs/2026-09-16-translation-llm-provider-design.md`.
@@ -2826,13 +2835,17 @@ Add a bullet under "Managing the VM stack", after the LibreTranslate bullet:
 
 - [ ] **Step 2: Full verification**
 
-Run: `npm run build && npm test && npm run lint && npm run format -- --check && npm run test:cov 2>&1 | tail -20`
+Run: `npm run build && npm test && npm run lint && npx prettier --check "src/**/*.ts" "test/**/*.ts" && npm run test:cov 2>&1 | tail -20`
 Expected: build ok, all suites green, coverage thresholds met.
+
+> **Correction:** not `npm run format -- --check`. This repo defines `format` as `prettier --write`, so the
+> appended flag does not turn it into a check — it rewrites the very files it was supposed to verify.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add CLAUDE.md
+# NOT `git add CLAUDE.md` — that file is git-ignored and the add silently does nothing.
+git add docs/superpowers/specs/2026-09-16-translation-llm-provider-design.md
 git commit -m "docs: VM ops notes for the AI translator provider"
 ```
 

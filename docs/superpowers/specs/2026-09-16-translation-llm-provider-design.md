@@ -450,9 +450,10 @@ an explicit-content sample to the configured provider and prints the parsed resu
 
 1. Put the xAI key in `/opt/openwa/secrets/xai.key` (root-only, `chmod 600`).
 2. Extend `/opt/openwa/enable-plugin.sh` config PUT to include `llmEnabled`, `llmBaseUrl`, `llmModel`,
-   `llmApiKey` (read from the file), `contextTurns`, `defaultPrivacy`, `operatorWids` (Doug's WhatsApp ID,
-   both `<phone>@c.us` and the `@lid` form once observed in logs). This script is the source of truth for
-   plugin config after every container restart (extension plugin state is not persisted).
+   `llmApiKey` (read from the file), `llmTimeoutMs`, `contextTurns`, `defaultPrivacy`, `operatorWids`
+   (Doug's WhatsApp ID, both `<phone>@c.us` and the `@lid` form once observed in logs). This script is the
+   source of truth for plugin config after every container restart (extension plugin state is not
+   persisted).
 3. Rebuild/redeploy the `openwa-api` image from the branch, `docker compose --profile with-dashboard up -d`,
    then `systemctl restart owa-plugin-config`.
 4. Verify: `/tr status` in the test group shows the AI translator `ok`; send a message; confirm the reply
@@ -461,7 +462,40 @@ an explicit-content sample to the configured provider and prints the parsed resu
    SSRF-guarded `ctx.net.fetch`, so no allow-list change. Confirm the Linode Cloud Firewall permits outbound
    443 (it does today for LibreTranslate model downloads).
 
-Update `CLAUDE.md` "Managing the VM stack" with the new secret file and config keys.
+### 15a. Operational runbook (tracked — this is the canonical copy)
+
+**Why this lives here.** `CLAUDE.md` is git-ignored (`.gitignore:75`, grouped with `.claude/`, `.agent/`
+and `.remember/`) and has never been committed in this repo's history. Keeping it machine-local is
+deliberate policy, not an oversight — which means **`CLAUDE.md` cannot carry deployment knowledge**, because
+nothing written there reaches anyone else or survives the loss of one laptop. Mirroring the operational
+notes into this section is optional-to-nice on the laptop and mandatory for the next operator. Updating the
+local `CLAUDE.md` too is a convenience for whoever works on that machine, not a substitute for this section.
+
+- **Translation chain.** The AI translator is the primary provider; LibreTranslate is the fallback. The xAI
+  key lives at `/opt/openwa/secrets/xai.key`, root-only (`chmod 600`). If the key is absent or
+  `llmEnabled` is false, the chain silently degrades to LibreTranslate-only — there is no error, so diagnose
+  it with `/tr status` in a group, which names each provider and its health.
+- **Config is re-applied on every boot.** Extension plugins do not persist their enabled-state or config, so
+  `/opt/openwa/enable-plugin.sh` (driven by the `owa-plugin-config` systemd oneshot, which waits for
+  `/api/health/ready`) re-PUTs `llmEnabled`, `llmBaseUrl`, `llmModel`, `llmApiKey` (read from the key file),
+  `llmTimeoutMs`, `contextTurns`, `defaultPrivacy` and `operatorWids` after every container restart. Run
+  `systemctl restart owa-plugin-config` after any `docker compose restart`.
+- **A runtime `/tr model switch` survives that re-PUT.** The operator's choice is persisted separately, in
+  plugin KV storage under `llm:model` (not in plugin config), and `index.ts` applies it over the `llmModel`
+  config key when building the adapter. That is exactly what makes it survive the boot-time re-PUT. The
+  consequence for operators: to change the model permanently you must edit `llmModel` **and** clear the
+  stored selection — editing config alone will appear to do nothing.
+- **The switchable catalog is filtered to text-capable models** (section 7). `/tr model list` and the
+  validation behind `switch` both see only models the provider has not declared non-textual; models
+  declaring no modalities at all are kept, so self-hosted Ollama / LM Studio catalogs are not emptied. A
+  model missing from the list is usually an image or video model, not a failed lookup.
+- **Per-group opt-out.** `/tr privacy local` pins a group to LibreTranslate only, so no text from it leaves
+  the VM; `/tr privacy cloud` returns it to the LLM path and posts the one-time external-AI disclosure.
+  Either switch clears that group's buffered context (section 10). The instance-wide default is the
+  `defaultPrivacy` config key, and flipping that from `local` to `cloud` drops retained context wholesale.
+- **`/tr model` is operator-gated** by `operatorWids`; group admins and delegates are not sufficient, because
+  the model is instance-wide state. Add both the `<phone>@c.us` and `@lid` forms — the host may deliver the
+  same person's messages under either.
 
 ## 16. Execution model
 
@@ -524,6 +558,14 @@ until this is decided. Three options are under consideration:
    non-Latin script as correct localization rather than a violation.
 2. Keep tuning the prompt (e.g. per-target instruction, or restating the glossary inside the user payload).
 3. Post-process deterministically: restore the Latin spelling of every glossary name in the output.
+
+### Operational knowledge has no machine-local home
+
+Recorded so it is not rediscovered: `CLAUDE.md` is git-ignored and has never been committed here, so any
+future operational note written only there is one laptop away from being lost. §15a is the tracked home;
+add to it first, and treat the local `CLAUDE.md` as a mirror. Both this spec and the implementation plan
+originally named `CLAUDE.md` as *the* destination for these notes, and the plan's commit step even ran
+`git add CLAUDE.md`, which silently does nothing. Both have been corrected.
 
 ### Deferred minors (worth a triage pass before merge)
 
