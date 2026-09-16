@@ -147,6 +147,14 @@ export class TranslationCoordinator {
       allowExternal: this.effectivePrivacy(state).mode === 'cloud',
     };
 
+    // Disclose BEFORE the text can reach an external provider. `/tr on` and `/tr privacy cloud`
+    // cover groups that opt in from here on; this covers the groups that were already active when
+    // cloud translation arrived, which would otherwise be processed externally having never been
+    // told. Deliberately placed ahead of `translateAll` rather than beside `maybeNotifyHealth`
+    // below: every post-translate site is reachable only past an early return that a failed or
+    // target-less translation takes, and `privacyDisclosed` keeps it to once per group regardless.
+    if (request.allowExternal) await this.discloseIfNeeded(sessionId, state);
+
     let result: TranslateResult;
     try {
       result = await this.translator.translateAll(request);
@@ -157,6 +165,10 @@ export class TranslationCoordinator {
         error: err instanceof Error ? err.message : String(err),
       });
       this.remember(sessionId, msg.chatId, authorName, sender.lang ?? 'und', text);
+      // A total outage is exactly when the group most needs to know why the bot went quiet, so the
+      // notice must not be confined to the happy path. `maybeNotifyHealth` keeps its own local-only
+      // suppression, so a local group still hears nothing about the external provider.
+      await this.maybeNotifyHealth(sessionId, state);
       await this.store.save(state);
       return;
     }
@@ -487,12 +499,16 @@ export class TranslationCoordinator {
     }
   }
 
-  /** Post the cloud disclosure once per group, only when cloud translation is in effect (spec §10). */
+  /**
+   * Post the cloud disclosure once per group, only when cloud translation is in effect (spec §10).
+   * Send BEFORE marking the group disclosed: if the send fails the flag stays unset, so the next
+   * message retries. Persisting first would permanently silence a notice the group never received.
+   */
   private async discloseIfNeeded(sessionId: string, state: GroupState): Promise<void> {
     if (state.privacyDisclosed || this.effectivePrivacy(state).mode !== 'cloud') return;
+    await this.gateway.sendText(sessionId, state.chatId, buildDisclosureText(this.opts.prefix));
     state.privacyDisclosed = true;
     await this.store.save(state);
-    await this.gateway.sendText(sessionId, state.chatId, buildDisclosureText(this.opts.prefix));
   }
 
   /** `/tr model [list|switch <id>]` — operator-only; the caller has already checked the allow-list. */

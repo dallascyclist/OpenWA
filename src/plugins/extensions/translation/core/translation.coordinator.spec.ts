@@ -845,4 +845,147 @@ describe('TranslationCoordinator', () => {
       );
     });
   });
+
+  describe('disclosure on the translate path', () => {
+    const cloudActive = () =>
+      freshState({
+        active: true,
+        announced: true,
+        participants: {
+          '111@c.us': { lang: 'es', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+          '222@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+        },
+      });
+
+    function translateDeps(state: GroupState) {
+      const deps = makeDeps(state);
+      const translateAll = jest.fn().mockResolvedValue({
+        detected: 'es',
+        source: 'es',
+        translations: [{ lang: 'en', text: 'hi' }],
+        provider: 'llm',
+      });
+      const fake: ContextualTranslator = {
+        name: 'chain',
+        external: false,
+        translateAll,
+        languages: deps.mocks.languages,
+        isHealthy: () => true,
+      };
+      const c = new TranslationCoordinator(fake, deps.store, deps.gateway, OPTS, undefined, deps.extras);
+      const disclosures = () =>
+        (deps.mocks.sendText.mock.calls as unknown[][]).filter(call => /external AI/i.test(call[2] as string));
+      return { c, translateAll, disclosures, mocks: deps.mocks, saved: deps.saved };
+    }
+
+    it('discloses to an already-active group on its next translated message, exactly once', async () => {
+      const state = cloudActive();
+      const { c, disclosures, saved } = translateDeps(state);
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      expect(disclosures()).toHaveLength(1);
+      expect(saved[saved.length - 1].privacyDisclosed).toBe(true);
+      await c.handleMessage('s', msg({ body: 'hola otra' }));
+      expect(disclosures()).toHaveLength(1);
+    });
+
+    it('discloses before the text is handed to the provider', async () => {
+      const { c, translateAll, mocks } = translateDeps(cloudActive());
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      const discloseOrder = mocks.sendText.mock.invocationCallOrder[0];
+      expect(translateAll.mock.invocationCallOrder[0]).toBeGreaterThan(discloseOrder);
+    });
+
+    it('never discloses on the translate path in a local-only group', async () => {
+      const { c, disclosures } = translateDeps({ ...cloudActive(), privacy: 'local' });
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      expect(disclosures()).toHaveLength(0);
+    });
+
+    it('still discloses when the translation itself fails', async () => {
+      const { c, translateAll, disclosures } = translateDeps(cloudActive());
+      translateAll.mockRejectedValue(new Error('all providers down'));
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      expect(disclosures()).toHaveLength(1);
+    });
+
+    it('retries the disclosure when the send fails, leaving the group undisclosed', async () => {
+      const state = cloudActive();
+      const { c, disclosures, mocks, saved } = translateDeps(state);
+      mocks.sendText.mockImplementation((_s: string, _c: string, text: string) =>
+        /external AI/i.test(text) ? Promise.reject(new Error('offline')) : Promise.resolve(undefined),
+      );
+      await expect(c.handleMessage('s', msg({ body: 'hola' }))).rejects.toThrow('offline');
+      expect(state.privacyDisclosed).toBeUndefined();
+      expect(saved.some(s => s.privacyDisclosed === true)).toBe(false);
+
+      mocks.sendText.mockResolvedValue(undefined);
+      await c.handleMessage('s', msg({ body: 'hola otra' }));
+      expect(disclosures()).toHaveLength(2); // the failed attempt plus the retry
+      expect(state.privacyDisclosed).toBe(true);
+      expect(saved[saved.length - 1].privacyDisclosed).toBe(true);
+    });
+  });
+
+  describe('health notices on the outage path', () => {
+    function outageDeps(state: GroupState) {
+      const deps = makeDeps(state);
+      const health = { llm: true, lt: true };
+      const providerHealth = () => [
+        { name: 'llm', external: true, healthy: health.llm },
+        { name: 'libretranslate', external: false, healthy: health.lt },
+      ];
+      const translateAll = jest.fn().mockResolvedValue({
+        detected: 'es',
+        source: 'es',
+        translations: [{ lang: 'en', text: 'hi' }],
+        provider: 'llm',
+      });
+      const fake: ContextualTranslator = {
+        name: 'chain',
+        external: false,
+        translateAll,
+        languages: deps.mocks.languages,
+        isHealthy: () => true,
+      };
+      const c = new TranslationCoordinator(fake, deps.store, deps.gateway, OPTS, undefined, {
+        ...deps.extras,
+        providerHealth,
+      });
+      const notices = () =>
+        (deps.mocks.sendText.mock.calls as unknown[][])
+          .map(call => call[2] as string)
+          .filter(t => /AI translation/.test(t));
+      return { c, health, notices, translateAll };
+    }
+    const active = () =>
+      freshState({
+        active: true,
+        announced: true,
+        participants: {
+          '111@c.us': { lang: 'es', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+          '222@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+        },
+      });
+
+    it('announces the outage when every provider fails, not just on the happy path', async () => {
+      const { c, health, notices, translateAll } = outageDeps(active());
+      await c.handleMessage('s', msg({ body: 'hola' })); // baseline, no notice
+      expect(notices()).toEqual([]);
+      health.llm = false;
+      translateAll.mockRejectedValue(new Error('all providers down'));
+      await c.handleMessage('s', msg({ body: 'hola otra' }));
+      expect(notices()).toEqual([
+        '⚠️ AI translation is temporarily unavailable; using basic translation until it recovers.',
+      ]);
+    });
+
+    it('stays silent about the outage in a local-only group', async () => {
+      const { c, health, notices, translateAll } = outageDeps({ ...active(), privacy: 'local' });
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      health.llm = false;
+      translateAll.mockRejectedValue(new Error('all providers down'));
+      await c.handleMessage('s', msg({ body: 'hola otra' }));
+      expect(notices()).toEqual([]);
+    });
+  });
 });
