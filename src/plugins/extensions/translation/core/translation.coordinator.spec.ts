@@ -574,4 +574,99 @@ describe('TranslationCoordinator', () => {
     expect(sent).toContain('Basic translator (libretranslate): unreachable');
     expect(sent).toContain('Privacy: cloud (group override)');
   });
+
+  describe('privacy', () => {
+    it('forces allowExternal=false when the group is local', async () => {
+      const state = freshState({ active: true, announced: true, privacy: 'local' });
+      const { store, gateway, extras, mocks } = makeDeps(state);
+      const translateAll = jest
+        .fn()
+        .mockResolvedValue({ detected: 'es', source: 'es', translations: [], provider: 'libretranslate' });
+      const fake: ContextualTranslator = {
+        name: 'chain',
+        external: false,
+        translateAll,
+        languages: mocks.languages,
+        isHealthy: () => true,
+      };
+      const c = new TranslationCoordinator(fake, store, gateway, OPTS, undefined, extras);
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      const req = (translateAll.mock.calls as unknown[][])[0][0] as TranslateRequest;
+      expect(req.allowExternal).toBe(false);
+    });
+
+    it('uses the instance default when the group has no override', async () => {
+      const state = freshState({ active: true, announced: true });
+      const { store, gateway, extras, mocks } = makeDeps(state);
+      const translateAll = jest
+        .fn()
+        .mockResolvedValue({ detected: 'es', source: 'es', translations: [], provider: 'libretranslate' });
+      const fake: ContextualTranslator = {
+        name: 'chain',
+        external: false,
+        translateAll,
+        languages: mocks.languages,
+        isHealthy: () => true,
+      };
+      const c = new TranslationCoordinator(
+        fake,
+        store,
+        gateway,
+        { ...OPTS, defaultPrivacy: 'local' },
+        undefined,
+        extras,
+      );
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      const req = (translateAll.mock.calls as unknown[][])[0][0] as TranslateRequest;
+      expect(req.allowExternal).toBe(false);
+    });
+
+    it('/tr privacy is open to anyone and shows the effective mode', async () => {
+      const state = freshState({ announced: true });
+      const { store, gateway, translator, mocks } = makeDeps(state);
+      const c = new TranslationCoordinator(translator, store, gateway, OPTS);
+      await c.handleMessage('s', msg({ body: '/tr privacy' }));
+      expect(mocks.getGroupAdmins).not.toHaveBeenCalled();
+      expect(mocks.sendText).toHaveBeenCalledWith('s', 'g@g.us', expect.stringContaining('cloud (instance default)'));
+    });
+
+    it('/tr privacy local is admin-gated and persists the override', async () => {
+      const state = freshState({ announced: true });
+      const { store, gateway, translator, saved, mocks } = makeDeps(state);
+      const c = new TranslationCoordinator(translator, store, gateway, OPTS);
+      await c.handleMessage('s', msg({ body: '/tr privacy local' }));
+      expect(mocks.sendText).toHaveBeenLastCalledWith('s', 'g@g.us', expect.stringMatching(/⛔/));
+      mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
+      await c.handleMessage('s', msg({ body: '/tr privacy local' }));
+      expect(saved[saved.length - 1].privacy).toBe('local');
+      expect(mocks.sendText).toHaveBeenLastCalledWith('s', 'g@g.us', expect.stringContaining('local'));
+    });
+
+    it('discloses cloud use exactly once: on /tr on, not again on a later /tr on', async () => {
+      const state = freshState({ announced: true });
+      const { store, gateway, translator, saved, mocks } = makeDeps(state);
+      mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
+      const c = new TranslationCoordinator(translator, store, gateway, OPTS);
+      await c.handleMessage('s', msg({ body: '/tr on' }));
+      const disclosures = () =>
+        (mocks.sendText.mock.calls as unknown[][]).filter(call => /external AI/i.test(call[2] as string));
+      expect(disclosures()).toHaveLength(1);
+      expect(saved[saved.length - 1].privacyDisclosed).toBe(true);
+      await c.handleMessage('s', msg({ body: '/tr on' }));
+      expect(disclosures()).toHaveLength(1);
+    });
+
+    it('does not disclose on /tr on in a local group, but does when switched to cloud', async () => {
+      const state = freshState({ announced: true, privacy: 'local' });
+      const { store, gateway, translator, mocks } = makeDeps(state);
+      mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
+      const c = new TranslationCoordinator(translator, store, gateway, OPTS);
+      const disclosures = () =>
+        (mocks.sendText.mock.calls as unknown[][]).filter(call => /external AI/i.test(call[2] as string));
+      await c.handleMessage('s', msg({ body: '/tr on' }));
+      expect(disclosures()).toHaveLength(0);
+      await c.handleMessage('s', msg({ body: '/tr privacy cloud' }));
+      expect(disclosures()).toHaveLength(1);
+    });
+  });
 });

@@ -18,7 +18,13 @@ import {
   ProviderHealth,
 } from './ports';
 import { parseCommand } from './command.parser';
-import { buildHelpText, formatCombinedReply, formatStatus } from './reply.formatter';
+import {
+  buildDisclosureText,
+  buildHelpText,
+  formatCombinedReply,
+  formatPrivacy,
+  formatStatus,
+} from './reply.formatter';
 import { ConversationContext } from './conversation-context';
 
 export interface CoordinatorOptions {
@@ -340,6 +346,11 @@ export class TranslationCoordinator {
       );
       return;
     }
+    // The *show* form of `privacy` is open to anyone; only the *set* form is admin-gated below.
+    if (cmd.name === 'privacy' && !cmd.privacy) {
+      await this.gateway.sendText(sessionId, msg.chatId, formatPrivacy(this.effectivePrivacy(state), this.opts.prefix));
+      return;
+    }
 
     const targetsSelf = cmd.target?.kind === 'me';
     const isSelfServe = (cmd.name === 'setlang' || cmd.name === 'auto') && targetsSelf;
@@ -367,6 +378,7 @@ export class TranslationCoordinator {
       case 'on':
         state.active = true;
         await this.confirm(sessionId, msg, '✅ Translation activated.', state);
+        await this.discloseIfNeeded(sessionId, state);
         return;
       case 'off':
         state.active = false;
@@ -425,10 +437,23 @@ export class TranslationCoordinator {
         );
         return;
       }
-      case 'privacy':
+      case 'privacy': {
+        state.privacy = cmd.privacy; // non-undefined here: the show form returned earlier
+        await this.confirm(sessionId, msg, `✅ Privacy set to ${cmd.privacy} for this group.`, state);
+        await this.discloseIfNeeded(sessionId, state);
+        return;
+      }
       case 'model':
-        return; // implemented in later tasks
+        return; // implemented in a later task
     }
+  }
+
+  /** Post the cloud disclosure once per group, only when cloud translation is in effect (spec §10). */
+  private async discloseIfNeeded(sessionId: string, state: GroupState): Promise<void> {
+    if (state.privacyDisclosed || this.effectivePrivacy(state).mode !== 'cloud') return;
+    state.privacyDisclosed = true;
+    await this.store.save(state);
+    await this.gateway.sendText(sessionId, state.chatId, buildDisclosureText(this.opts.prefix));
   }
 
   private resolveTarget(msg: InboundMessage, target?: CommandTarget): string | null {
