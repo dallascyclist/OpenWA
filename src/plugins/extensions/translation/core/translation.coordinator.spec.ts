@@ -669,4 +669,76 @@ describe('TranslationCoordinator', () => {
       expect(disclosures()).toHaveLength(1);
     });
   });
+
+  describe('health notices', () => {
+    function healthDeps(state: GroupState) {
+      const deps = makeDeps(state);
+      const health = { llm: true, lt: true };
+      const providerHealth = () => [
+        { name: 'llm', external: true, healthy: health.llm },
+        { name: 'libretranslate', external: false, healthy: health.lt },
+      ];
+      const translateAll = jest.fn().mockResolvedValue({
+        detected: 'es',
+        source: 'es',
+        translations: [{ lang: 'en', text: 'hi' }],
+        provider: 'llm',
+      });
+      const fake: ContextualTranslator = {
+        name: 'chain',
+        external: false,
+        translateAll,
+        languages: deps.mocks.languages,
+        isHealthy: () => true,
+      };
+      const c = new TranslationCoordinator(fake, deps.store, deps.gateway, OPTS, undefined, {
+        ...deps.extras,
+        providerHealth,
+      });
+      const notices = () =>
+        (deps.mocks.sendText.mock.calls as unknown[][])
+          .map(call => call[2] as string)
+          .filter(t => /AI translation/.test(t));
+      return { c, health, notices, mocks: deps.mocks };
+    }
+    const active = () =>
+      freshState({
+        active: true,
+        announced: true,
+        participants: {
+          '111@c.us': { lang: 'es', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+          '222@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+        },
+      });
+
+    it('posts one degraded notice per transition, after the reply, and one recovery notice', async () => {
+      const { c, health, notices, mocks } = healthDeps(active());
+      await c.handleMessage('s', msg({ body: 'hola' })); // baseline, no notice
+      expect(notices()).toEqual([]);
+      health.llm = false;
+      await c.handleMessage('s', msg({ body: 'hola otra' }));
+      expect(notices()).toEqual([
+        '⚠️ AI translation is temporarily unavailable; using basic translation until it recovers.',
+      ]);
+      const replyOrder = mocks.sendCombinedReply.mock.invocationCallOrder[1];
+      const noticeOrder = mocks.sendText.mock.invocationCallOrder[mocks.sendText.mock.calls.length - 1];
+      expect(replyOrder).toBeLessThan(noticeOrder);
+      await c.handleMessage('s', msg({ body: 'hola tres' }));
+      expect(notices()).toHaveLength(1);
+      health.llm = true;
+      await c.handleMessage('s', msg({ body: 'hola cuatro' }));
+      expect(notices()).toEqual([
+        '⚠️ AI translation is temporarily unavailable; using basic translation until it recovers.',
+        '✅ AI translation is back.',
+      ]);
+    });
+
+    it('never mentions the external provider in a local-only group', async () => {
+      const { c, health, notices } = healthDeps({ ...active(), privacy: 'local' });
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      health.llm = false;
+      await c.handleMessage('s', msg({ body: 'hola otra' }));
+      expect(notices()).toEqual([]);
+    });
+  });
 });

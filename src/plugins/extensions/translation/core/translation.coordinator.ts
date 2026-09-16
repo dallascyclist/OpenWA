@@ -22,6 +22,7 @@ import {
   buildDisclosureText,
   buildHelpText,
   formatCombinedReply,
+  formatHealthNotice,
   formatPrivacy,
   formatStatus,
 } from './reply.formatter';
@@ -64,6 +65,8 @@ function widEquals(a: string, b: string): boolean {
 export class TranslationCoordinator {
   private readonly context: ConversationContext;
   private readonly extras: CoordinatorExtras;
+  /** Per group: the provider health we last told that group about (spec §11). Not persisted. */
+  private readonly notifiedHealth = new Map<string, Map<string, boolean>>();
 
   constructor(
     private readonly translator: ContextualTranslator,
@@ -223,7 +226,33 @@ export class TranslationCoordinator {
     if (translations.length > 0) {
       await this.gateway.sendCombinedReply(sessionId, msg.chatId, msg.id, formatCombinedReply(translations));
     }
+    await this.maybeNotifyHealth(sessionId, state);
     await this.store.save(state);
+  }
+
+  /**
+   * Announce a provider health transition once per group, lazily on that group's next translated
+   * message (spec §11). The first sighting of a group since boot only records a baseline, so a
+   * restart never greets every group with a spurious "recovered" notice.
+   */
+  private async maybeNotifyHealth(sessionId: string, state: GroupState): Promise<void> {
+    const key = `${sessionId}:${state.chatId}`;
+    const current = this.providerHealth();
+    const known = this.notifiedHealth.get(key);
+    if (!known) {
+      // First sighting of this group since boot: record a baseline, say nothing.
+      this.notifiedHealth.set(key, new Map(current.map(p => [p.name, p.healthy])));
+      return;
+    }
+    const privacy = this.effectivePrivacy(state);
+    for (const p of current) {
+      if (known.get(p.name) === p.healthy) continue;
+      // Record the transition even when the notice is suppressed below, so a local-only group
+      // never hears a stale "recovered" the moment it switches to cloud.
+      known.set(p.name, p.healthy);
+      if (p.external && privacy.mode === 'local') continue;
+      await this.gateway.sendText(sessionId, state.chatId, formatHealthNotice(p));
+    }
   }
 
   private remember(sessionId: string, chatId: string, author: string, lang: string, text: string): void {
