@@ -96,6 +96,9 @@ export class ExtensionsRegistrar implements OnModuleInit {
             title: 'Default privacy mode',
             description:
               "'cloud' allows the AI translator by default; 'local' uses only LibreTranslate until a group opts in with /tr privacy cloud.",
+            // Rendered as a select, not a free-text box: an unrecognised value falls back to
+            // 'cloud', so a typo here would quietly widen external processing.
+            enum: ['cloud', 'local'],
             default: 'cloud',
           },
           operatorWids: {

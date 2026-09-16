@@ -11,7 +11,7 @@
  * configured — with the shipped default (`llmEnabled: false`) the chain holds exactly one
  * provider, LibreTranslate, and nothing external is ever contacted.
  */
-import { PluginContext, IPlugin } from '../../../core/plugins';
+import { PluginContext, PluginLogger, IPlugin } from '../../../core/plugins';
 import { HookContext, HookResult } from '../../../core/hooks';
 import { IncomingMessage } from '../../../engine/interfaces/whatsapp-engine.interface';
 import { TranslationCoordinator, CoordinatorOptions } from './core/translation.coordinator';
@@ -52,9 +52,31 @@ function readStringList(cfg: Record<string, unknown>, key: string): string[] {
     .map(s => s.trim())
     .filter(s => s.length > 0);
 }
-function readPrivacy(cfg: Record<string, unknown>, key: string, fallback: PrivacyMode): PrivacyMode {
+/**
+ * Anything that is not exactly `'cloud'` or `'local'` falls back, and the fallback is `'cloud'` —
+ * i.e. this fails OPEN. That is the wrong direction for a privacy control: an operator who typed
+ * `Local` or `local ` asked for *less* external processing and would silently get more. The config
+ * schema's `enum` closes the realistic way in (the dashboard renders a select, not a text box);
+ * this warning covers what can still reach here — API clients, a hand-edited config store. The
+ * fallback direction itself is deliberately unchanged; flipping it to fail closed is a larger
+ * behavioural call than this hardening.
+ */
+function readPrivacy(
+  cfg: Record<string, unknown>,
+  key: string,
+  fallback: PrivacyMode,
+  logger?: PluginLogger,
+): PrivacyMode {
   const v = cfg[key];
-  return v === 'cloud' || v === 'local' ? v : fallback;
+  if (v === 'cloud' || v === 'local') return v;
+  if (v !== undefined && v !== null && v !== '') {
+    logger?.warn(`Unrecognised ${key} value; falling back to '${fallback}'`, {
+      action: 'translation_privacy_unrecognised',
+      value: v,
+      fallback,
+    });
+  }
+  return fallback;
 }
 
 export class TranslationPlugin implements IPlugin {
@@ -71,7 +93,17 @@ export class TranslationPlugin implements IPlugin {
   private contextTurns: number | undefined;
 
   async onEnable(context: PluginContext): Promise<void> {
-    this.coordinator = await this.buildCoordinator(context);
+    // Logged here so the failure is attributed to this plugin, then rethrown: the loader awaits
+    // `onEnable` inside its own try/catch and uses a throw to mark the plugin ERROR and surface the
+    // message to the operator. Swallowing here would report a broken plugin as ENABLED.
+    try {
+      this.coordinator = await this.buildCoordinator(context);
+    } catch (error) {
+      context.logger.error('Translation plugin failed to build its coordinator', error, {
+        action: 'translation_rebuild_failed',
+      });
+      throw error;
+    }
     context.registerHook('message:received', ctx => this.onMessage(context, ctx as HookContext<IncomingMessage>));
     context.logger.log('Translation plugin enabled', { action: 'translation_enabled' });
   }
@@ -79,7 +111,19 @@ export class TranslationPlugin implements IPlugin {
   async onConfigChange(context: PluginContext): Promise<void> {
     // Rebuild the coordinator so a config edit (e.g. a new LibreTranslate URL/key saved from the
     // dashboard) takes effect immediately, without a disable/enable cycle.
-    this.coordinator = await this.buildCoordinator(context);
+    //
+    // Unlike `onEnable`, this must NOT reject: the loader calls it fire-and-forget
+    // (`void plugin.instance.onConfigChange(...)`), so a rejection escapes as an unhandled
+    // rejection. The previous coordinator is left in place, so a bad edit degrades to "config did
+    // not apply" rather than taking the plugin dark.
+    try {
+      this.coordinator = await this.buildCoordinator(context);
+    } catch (error) {
+      context.logger.error('Translation plugin failed to apply its new config; keeping the previous one', error, {
+        action: 'translation_rebuild_failed',
+      });
+      return;
+    }
     context.logger.log('Translation plugin config updated', { action: 'translation_config_changed' });
   }
 
@@ -101,7 +145,17 @@ export class TranslationPlugin implements IPlugin {
     const providers: ContextualTranslator[] = [];
     let llm: OpenAiCompatibleClient | undefined;
     const llmApiKey = readOptionalString(cfg, 'llmApiKey');
-    if (readBool(cfg, 'llmEnabled', false) && llmApiKey) {
+    const llmEnabled = readBool(cfg, 'llmEnabled', false);
+    // Enabled-but-keyless is a silent degradation: the LLM simply never joins the chain and every
+    // translation quietly falls to LibreTranslate. It is also reachable by accident — if the
+    // dashboard re-posts an untouched password field as '', an unrelated config edit switches the
+    // AI translator off. Say so, so it is greppable instead of invisible.
+    if (llmEnabled && !llmApiKey) {
+      context.logger.warn('AI translator is enabled but no API key is configured; using LibreTranslate alone', {
+        action: 'translation_llm_no_key',
+      });
+    }
+    if (llmEnabled && llmApiKey) {
       const persisted = await modelStore.load();
       // `??` alone would let a blank persisted value through as the active model.
       const persistedModel =
@@ -121,7 +175,7 @@ export class TranslationPlugin implements IPlugin {
     providers.push(new LibreTranslateContextual(libre, logger));
     const chain = new FallbackChain(providers, logger);
 
-    const defaultPrivacy = readPrivacy(cfg, 'defaultPrivacy', 'cloud');
+    const defaultPrivacy = readPrivacy(cfg, 'defaultPrivacy', 'cloud', context.logger);
     // Groups with no per-group override follow `defaultPrivacy`, so flipping the instance default
     // local -> cloud makes them cloud-eligible. History gathered while the instance was opted out
     // of external processing must not ride along into the first cloud request.

@@ -24,13 +24,21 @@ function makeStorage(seed: Record<string, unknown> = {}): PluginStorage {
   };
 }
 
-function makeContext(config: Record<string, unknown>, storage: PluginStorage = makeStorage()): PluginContext {
+function makeLogger() {
+  return { log: jest.fn(), debug: jest.fn(), warn: jest.fn(), error: jest.fn() };
+}
+
+function makeContext(
+  config: Record<string, unknown>,
+  storage: PluginStorage = makeStorage(),
+  logger: ReturnType<typeof makeLogger> = makeLogger(),
+): PluginContext {
   return {
     pluginId: 'translation',
     manifest: { id: 'translation' },
     config,
     hookManager: {},
-    logger: { log: () => {}, debug: () => {}, warn: () => {}, error: () => {} },
+    logger,
     storage,
     registerHook: () => {},
     messages: {},
@@ -187,6 +195,140 @@ describe('TranslationPlugin wiring', () => {
       await plugin.onEnable(makeContext({}));
       const coordinator = (plugin as unknown as { coordinator: unknown }).coordinator;
       expect((coordinator as { context: ConversationContext }).context).toBe(retainedContext(plugin));
+    });
+  });
+
+  // A privacy control that fails open is the wrong direction: an operator who typed `Local` asked
+  // for LESS external processing and would silently get more. The enum in the config schema closes
+  // the realistic path in; the warning covers whatever still gets through (API clients, the
+  // generated `.env`, a hand-edited store).
+  describe('defaultPrivacy misconfiguration', () => {
+    it('warns, naming the value and the mode it fell back to, on an unrecognised value', async () => {
+      const logger = makeLogger();
+      const plugin = new TranslationPlugin();
+      await plugin.onEnable(makeContext({ defaultPrivacy: 'Local' }, makeStorage(), logger));
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('defaultPrivacy'),
+        expect.objectContaining({ action: 'translation_privacy_unrecognised', value: 'Local', fallback: 'cloud' }),
+      );
+    });
+
+    it('warns on a value that is only off by whitespace', async () => {
+      const logger = makeLogger();
+      const plugin = new TranslationPlugin();
+      await plugin.onEnable(makeContext({ defaultPrivacy: 'local ' }, makeStorage(), logger));
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ value: 'local ', fallback: 'cloud' }),
+      );
+    });
+
+    it('still falls back to cloud, so the fallback direction is unchanged', async () => {
+      const plugin = new TranslationPlugin();
+      await plugin.onEnable(makeContext({ defaultPrivacy: 'Local' }));
+      const coordinator = (plugin as unknown as { coordinator: unknown }).coordinator;
+      expect((coordinator as { opts: { defaultPrivacy: string } }).opts.defaultPrivacy).toBe('cloud');
+    });
+
+    it.each([['local'], ['cloud']])('stays quiet on the valid value %s', async value => {
+      const logger = makeLogger();
+      const plugin = new TranslationPlugin();
+      await plugin.onEnable(makeContext({ defaultPrivacy: value }, makeStorage(), logger));
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+
+    it('stays quiet when the key is absent entirely', async () => {
+      const logger = makeLogger();
+      const plugin = new TranslationPlugin();
+      await plugin.onEnable(makeContext({}, makeStorage(), logger));
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+  });
+
+  // If the dashboard re-posts an untouched password field as '', the LLM drops out of the chain
+  // and translation silently degrades to LibreTranslate. Make that greppable.
+  describe('llmEnabled without a usable API key', () => {
+    it('warns that LibreTranslate alone will be used', async () => {
+      const logger = makeLogger();
+      const plugin = new TranslationPlugin();
+      await plugin.onEnable(makeContext({ llmEnabled: true }, makeStorage(), logger));
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringMatching(/API key/i),
+        expect.objectContaining({ action: 'translation_llm_no_key' }),
+      );
+    });
+
+    it('warns the same way when the key is posted back as an empty string', async () => {
+      const logger = makeLogger();
+      const plugin = new TranslationPlugin();
+      await plugin.onEnable(makeContext({ llmEnabled: true, llmApiKey: '' }, makeStorage(), logger));
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ action: 'translation_llm_no_key' }),
+      );
+    });
+
+    it('stays quiet when the key is present', async () => {
+      const logger = makeLogger();
+      const plugin = new TranslationPlugin();
+      await plugin.onEnable(makeContext({ llmEnabled: true, llmApiKey: 'sk-test' }, makeStorage(), logger));
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+
+    it('stays quiet when the AI translator is simply off', async () => {
+      const logger = makeLogger();
+      const plugin = new TranslationPlugin();
+      await plugin.onEnable(makeContext({ llmEnabled: false, llmApiKey: '' }, makeStorage(), logger));
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+  });
+
+  // The loader fire-and-forgets `onConfigChange` with `void`, so a rejection there becomes an
+  // unhandled rejection and can take the process down.
+  describe('a failing rebuild', () => {
+    function brokenStorage(): PluginStorage {
+      return { ...makeStorage(), get: () => Promise.reject(new Error('storage exploded')) };
+    }
+
+    it('does not reject out of onConfigChange; it logs instead', async () => {
+      const plugin = new TranslationPlugin();
+      await plugin.onEnable(makeContext({}));
+      const logger = makeLogger();
+
+      await expect(
+        plugin.onConfigChange(makeContext({ llmEnabled: true, llmApiKey: 'sk-test' }, brokenStorage(), logger)),
+      ).resolves.toBeUndefined();
+
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(Error),
+        expect.objectContaining({ action: 'translation_rebuild_failed' }),
+      );
+    });
+
+    it('keeps the previous working coordinator rather than going dark', async () => {
+      const plugin = new TranslationPlugin();
+      await plugin.onEnable(makeContext({}));
+      const before = (plugin as unknown as { coordinator: unknown }).coordinator;
+
+      await plugin.onConfigChange(makeContext({ llmEnabled: true, llmApiKey: 'sk-test' }, brokenStorage()));
+
+      expect((plugin as unknown as { coordinator: unknown }).coordinator).toBe(before);
+    });
+
+    it('still rethrows from onEnable, so the loader can mark the plugin ERROR', async () => {
+      const plugin = new TranslationPlugin();
+      const logger = makeLogger();
+      await expect(
+        plugin.onEnable(makeContext({ llmEnabled: true, llmApiKey: 'sk-test' }, brokenStorage(), logger)),
+      ).rejects.toThrow('storage exploded');
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(Error),
+        expect.objectContaining({ action: 'translation_rebuild_failed' }),
+      );
     });
   });
 
