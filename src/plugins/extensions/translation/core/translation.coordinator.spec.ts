@@ -430,6 +430,48 @@ describe('TranslationCoordinator', () => {
     expect(mocks.sendCombinedReply).not.toHaveBeenCalled();
   });
 
+  it('posts nothing when a confirming message abandons a language nobody else speaks', async () => {
+    // 111 is switching es -> en and 222 already speaks en, so once the switch is confirmed the
+    // group speaks only 'en' and there is nothing left to translate. The sanity rule and the
+    // backstop must therefore read the known languages recomputed AFTER `applyLearning`: if they
+    // read the pre-learning array they still see the abandoned 'es', the backstop fires, and the
+    // group gets a stray Spanish copy of a message every member can already read.
+    const state = freshState({
+      announced: true,
+      active: true,
+      participants: {
+        '111@c.us': {
+          lang: 'es',
+          source: 'learned',
+          enabled: true,
+          samples: 5,
+          updatedAt: 'x',
+          pendingLang: 'en', // one confirmation away from the switch
+        },
+        '222@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 5, updatedAt: 'x' },
+      },
+    });
+    const { store, gateway, translator, logger, saved, extras, mocks } = makeDeps(state);
+    mocks.detect.mockResolvedValue({ lang: 'en', confidence: 0.99 });
+    mocks.translate.mockImplementation((_text: string, src: string, tgt: string) => Promise.resolve(`${src}->${tgt}`));
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, logger, extras);
+
+    await c.handleMessage('s', msg({ author: '111@c.us', body: 'Sure, sounds good to me' }));
+
+    // The switch was learned...
+    expect(saved[saved.length - 1].participants['111@c.us'].lang).toBe('en');
+    // ...and nothing reached the group: no stray 'es' reply, and no misleading backstop warning.
+    expect(mocks.sendCombinedReply).not.toHaveBeenCalled();
+    expect(mocks.warn).not.toHaveBeenCalledWith(
+      'target backstop engaged (possible misroute or cross-language write)',
+      expect.anything(),
+    );
+    expect(mocks.debug).toHaveBeenCalledWith(
+      'no targets; group speaks only the source language',
+      expect.objectContaining({ action: 'translation_no_targets', source: 'en' }),
+    );
+  });
+
   it('sends one contextual request with candidates, hint, glossary and prior history (excluding the current message)', async () => {
     const state = freshState({
       active: true,

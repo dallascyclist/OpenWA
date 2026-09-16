@@ -134,8 +134,9 @@ export class TranslationCoordinator {
     // the message that CONFIRMS the switch is translated from the right language and into every
     // other language the group speaks — otherwise `targetLanguages` (which runs post-learning)
     // demands a target the provider was never asked for, and that recipient silently gets nothing.
-    // Deliberately scoped to the request: the sanity rule and backstop below keep using the
-    // unaugmented `knownLangs`, so an unconfirmed guess can never become the effective source.
+    // Deliberately scoped to the request: the sanity rule and backstop below recompute the group's
+    // known languages after learning and never see this augmentation, so an unconfirmed guess can
+    // never become the effective source.
     const candidateLangs =
       sender.pendingLang && !knownLangs.includes(sender.pendingLang)
         ? [...knownLangs, sender.pendingLang]
@@ -179,19 +180,30 @@ export class TranslationCoordinator {
 
     this.applyLearning(sender, result.detected);
 
+    // Recompute the group's languages AFTER learning. `applyLearning` may have just moved the
+    // sender onto a new language, which both adds that language and — when the sender was the last
+    // speaker of their old one — removes the old one from the group's set. The sanity rule and the
+    // backstop below must reason about the group as it is now: using the pre-learning array here
+    // makes the message that CONFIRMS a language switch get translated into the language the group
+    // has just abandoned (the backstop sees a stale entry, so it fires instead of staying silent),
+    // and logs a misleading `translation_backstop` warning while doing it. The pre-learning array
+    // above stays as it is — it feeds `candidateLangs`, which must describe the group as it was
+    // when the provider was asked.
+    const knownLangsNow = this.knownLanguages(state);
+
     // Pick the effective source language. Detection misfires on short/colloquial text — it often
     // returns a near-neighbour language (e.g. es misread as gl/ca) — so trust the detected code only
     // when it names a language the group actually uses; otherwise fall back to the sender's known
     // language. Combined with excluding the sender's own language from the targets below, this stops
     // a message ever being "translated" into its own language (the duplicate/echo bug).
-    const source = knownLangs.includes(result.detected) ? result.detected : (sender.lang ?? result.detected);
+    const source = knownLangsNow.includes(result.detected) ? result.detected : (sender.lang ?? result.detected);
 
     let targets = this.targetLanguages(state, source, sender.lang);
     if (targets.length === 0) {
       // Backstop: a real message detected in a known language must never be silently dropped due
       // to a sender/source mismatch (e.g. a misrouted @lid author keyed to the wrong participant).
       // Translate into every known language except the source — guarantees delivery.
-      const backstop = knownLangs.filter(l => l !== source);
+      const backstop = knownLangsNow.filter(l => l !== source);
       if (backstop.length === 0) {
         this.logger.debug('no targets; group speaks only the source language', {
           action: 'translation_no_targets',
@@ -234,7 +246,7 @@ export class TranslationCoordinator {
       detected: result.detected,
       source,
       senderLang: sender.lang,
-      knownLangs,
+      knownLangs: knownLangsNow,
       targets,
       sent: translations.length,
       provider: result.provider,
