@@ -603,6 +603,26 @@ add to it first, and treat the local `CLAUDE.md` as a mirror. Both this spec and
 originally named `CLAUDE.md` as *the* destination for these notes, and the plan's commit step even ran
 `git add CLAUDE.md`, which silently does nothing. Both have been corrected.
 
+### Rejected fixes (real findings whose obvious remedy is worse than the defect)
+
+Both of these were raised by the final whole-branch review and deliberately not implemented. They are
+recorded here, rather than only in the review notes, because the reasoning is the valuable part: without
+it someone reads the finding, writes the obvious patch, and ships a worse bug.
+
+- **A refusal wrapped in valid JSON is delivered as a translation.** `REFUSAL_RE` is consulted only when
+  the response body fails to parse, so `{"source":"es","translations":{"en":"I'm sorry, I can't help with
+  that."}}` passes validation and reaches the group. The obvious fix — running the refusal pattern over
+  translation *values* — must not be implemented: a user who writes "lo siento, no puedo ayudar con eso"
+  produces exactly that English string as a correct translation, and the check would classify it as a
+  provider refusal and drop an honest message. The remedy trades a rare defect (a strict provider
+  embedding a refusal in well-formed JSON; Grok does not do this) for a common one. If a future provider
+  makes this real, the answer is provider-specific refusal metadata, not pattern-matching the output.
+- **An armed `pendingLang` costs one discarded provider call per message.** While a participant's language
+  switch is awaiting its second confirming detection, the pending code is included in `candidateLangs`, so
+  the provider translates into a target the coordinator then filters out. This is deliberate: offering the
+  pending language is what stops the confirming message from losing a recipient (§6). The cost is one
+  extra target on a handful of messages per switch, and removing it reintroduces a group-visible bug.
+
 ### Deferred minors (worth a triage pass before merge)
 
 - `notifiedHealth` is never evicted. Bounded by groups seen since boot and cleared on restart, so it is a
