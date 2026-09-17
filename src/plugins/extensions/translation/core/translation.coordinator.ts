@@ -6,19 +6,45 @@ import {
   InboundMessage,
   ParsedCommand,
   ParticipantState,
-  Translation,
-  Translator,
   TranslationLogger,
   CommandTarget,
+  ContextualTranslator,
+  TranslateRequest,
+  TranslateResult,
+  PrivacyMode,
+  EffectivePrivacy,
+  ModelSwitchable,
+  ModelStore,
+  ProviderHealth,
 } from './ports';
 import { parseCommand } from './command.parser';
-import { buildHelpText, formatCombinedReply, formatStatus } from './reply.formatter';
+import {
+  buildDisclosureText,
+  buildHelpText,
+  formatCombinedReply,
+  formatHealthNotice,
+  formatModelList,
+  formatPrivacy,
+  formatStatus,
+} from './reply.formatter';
+import { ConversationContext } from './conversation-context';
 
 export interface CoordinatorOptions {
   prefix: string;
   minLength: number;
   maxLength: number;
   denyReply: boolean;
+  /** Instance default when a group has no override (spec D7). */
+  defaultPrivacy?: PrivacyMode;
+  /** WhatsApp IDs allowed to run `/tr model *` (spec D11). */
+  operatorWids?: string[];
+}
+
+export interface CoordinatorExtras {
+  context?: ConversationContext;
+  models?: ModelSwitchable;
+  modelStore?: ModelStore;
+  providerHealth?: () => ProviderHealth[];
 }
 
 const URL_OR_EMOJI_ONLY = /^(?:\s|\p{Emoji}|https?:\/\/\S+)+$/u;
@@ -38,13 +64,26 @@ function widEquals(a: string, b: string): boolean {
 }
 
 export class TranslationCoordinator {
+  private readonly context: ConversationContext;
+  private readonly extras: CoordinatorExtras;
+  /**
+   * Per group: the provider health we last told that group about (spec §11). Not persisted — one
+   * entry per group seen since boot, dropped on restart, which is also what makes the
+   * first-sighting baseline in `maybeNotifyHealth` work.
+   */
+  private readonly notifiedHealth = new Map<string, Map<string, boolean>>();
+
   constructor(
-    private readonly translator: Translator,
+    private readonly translator: ContextualTranslator,
     private readonly store: ConfigStore,
     private readonly gateway: ChatGateway,
     private readonly opts: CoordinatorOptions,
     private readonly logger: TranslationLogger = NOOP_LOGGER,
-  ) {}
+    extras: CoordinatorExtras = {},
+  ) {
+    this.extras = extras;
+    this.context = extras.context ?? new ConversationContext({ maxTurns: 10, maxChars: 2000 });
+  }
 
   async handleMessage(sessionId: string, msg: InboundMessage): Promise<{ swallow: boolean }> {
     if (!msg.isGroup || msg.fromMe || !msg.author) return { swallow: false };
@@ -81,35 +120,96 @@ export class TranslationCoordinator {
     if (msg.pushName && (sender.pushName === undefined || sender.pushName === msg.pushName)) {
       sender.pushName = msg.pushName;
     }
-    if (!sender.enabled) return;
+    const authorName = msg.pushName ?? senderKey.split('@')[0];
 
-    let detected: string;
-    try {
-      detected = (await this.translator.detect(text)).lang;
-    } catch {
-      return; // translator down — silent skip
+    if (!sender.enabled) {
+      // Ignored participants are still part of the conversation the LLM needs to follow (spec D10).
+      this.remember(sessionId, msg.chatId, authorName, sender.lang ?? 'und', text);
+      return;
     }
-    this.applyLearning(sender, detected);
+
+    const knownLangs = this.knownLanguages(state);
+    // A pending language is one confirmation away from becoming the sender's language, and
+    // `applyLearning` may promote it the moment the provider answers. Offer it to the provider so
+    // the message that CONFIRMS the switch is translated from the right language and into every
+    // other language the group speaks — otherwise `targetLanguages` (which runs post-learning)
+    // demands a target the provider was never asked for, and that recipient silently gets nothing.
+    // Deliberately scoped to the request: the sanity rule and backstop below recompute the group's
+    // known languages after learning and never see this augmentation, so an unconfirmed guess can
+    // never become the effective source.
+    const candidateLangs =
+      sender.pendingLang && !knownLangs.includes(sender.pendingLang)
+        ? [...knownLangs, sender.pendingLang]
+        : [...knownLangs];
+
+    const request: TranslateRequest = {
+      text,
+      senderName: authorName,
+      candidateLangs,
+      hintLang: sender.lang,
+      glossary: this.glossary(state, msg.pushName),
+      history: this.context.get(sessionId, msg.chatId),
+      allowExternal: this.effectivePrivacy(state).mode === 'cloud',
+    };
+
+    // Disclose BEFORE the text can reach an external provider. `/tr on` and `/tr privacy cloud`
+    // cover groups that opt in from here on; this covers the groups that were already active when
+    // cloud translation arrived, which would otherwise be processed externally having never been
+    // told. Deliberately placed ahead of `translateAll` rather than beside `maybeNotifyHealth`
+    // below: every post-translate site is reachable only past an early return that a failed or
+    // target-less translation takes, and `privacyDisclosed` keeps it to once per group regardless.
+    if (request.allowExternal) await this.discloseIfNeeded(sessionId, state);
+
+    let result: TranslateResult;
+    try {
+      result = await this.translator.translateAll(request);
+    } catch (err) {
+      // A provider failure is still a silent skip, as before, but the turn counts for context.
+      this.logger.warn('translation failed on all providers', {
+        action: 'translation_all_failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.remember(sessionId, msg.chatId, authorName, sender.lang ?? 'und', text);
+      // A total outage is exactly when the group most needs to know why the bot went quiet, so the
+      // notice must not be confined to the happy path. `maybeNotifyHealth` keeps its own local-only
+      // suppression, so a local group still hears nothing about the external provider.
+      await this.maybeNotifyHealth(sessionId, state);
+      await this.store.save(state);
+      return;
+    }
+
+    this.applyLearning(sender, result.detected);
+
+    // Recompute the group's languages AFTER learning. `applyLearning` may have just moved the
+    // sender onto a new language, which both adds that language and — when the sender was the last
+    // speaker of their old one — removes the old one from the group's set. The sanity rule and the
+    // backstop below must reason about the group as it is now: using the pre-learning array here
+    // makes the message that CONFIRMS a language switch get translated into the language the group
+    // has just abandoned (the backstop sees a stale entry, so it fires instead of staying silent),
+    // and logs a misleading `translation_backstop` warning while doing it. The pre-learning array
+    // above stays as it is — it feeds `candidateLangs`, which must describe the group as it was
+    // when the provider was asked.
+    const knownLangsNow = this.knownLanguages(state);
 
     // Pick the effective source language. Detection misfires on short/colloquial text — it often
     // returns a near-neighbour language (e.g. es misread as gl/ca) — so trust the detected code only
     // when it names a language the group actually uses; otherwise fall back to the sender's known
     // language. Combined with excluding the sender's own language from the targets below, this stops
     // a message ever being "translated" into its own language (the duplicate/echo bug).
-    const knownLangs = this.knownLanguages(state);
-    const source = knownLangs.includes(detected) ? detected : (sender.lang ?? detected);
+    const source = knownLangsNow.includes(result.detected) ? result.detected : (sender.lang ?? result.detected);
 
     let targets = this.targetLanguages(state, source, sender.lang);
     if (targets.length === 0) {
       // Backstop: a real message detected in a known language must never be silently dropped due
       // to a sender/source mismatch (e.g. a misrouted @lid author keyed to the wrong participant).
       // Translate into every known language except the source — guarantees delivery.
-      const backstop = knownLangs.filter(l => l !== source);
+      const backstop = knownLangsNow.filter(l => l !== source);
       if (backstop.length === 0) {
         this.logger.debug('no targets; group speaks only the source language', {
           action: 'translation_no_targets',
           source,
         });
+        this.remember(sessionId, msg.chatId, authorName, source, text);
         await this.store.save(state);
         return;
       }
@@ -124,38 +224,92 @@ export class TranslationCoordinator {
       targets = backstop;
     }
 
-    const settled = await Promise.allSettled(targets.map(t => this.translator.translate(text, source, t)));
-    const translations: Translation[] = [];
-    settled.forEach((r, i) => {
-      if (r.status === 'fulfilled') {
-        translations.push({ lang: targets[i], text: r.value });
-      } else {
-        this.logger.warn('translate call failed', {
+    const translations = result.translations.filter(t => targets.includes(t.lang));
+    for (const t of targets) {
+      if (!translations.some(x => x.lang === t)) {
+        this.logger.warn('target missing from provider result', {
           action: 'translation_translate_failed',
+          provider: result.provider,
           source,
-          target: targets[i],
-          error: String(r.reason),
+          target: t,
         });
       }
-    });
+    }
+
+    this.remember(sessionId, msg.chatId, authorName, source, text);
 
     this.logger.debug('translate decision', {
       action: 'translation_decision',
       author: msg.author,
       resolvedKey: senderKey,
       pushName: msg.pushName,
-      detected,
+      detected: result.detected,
       source,
       senderLang: sender.lang,
-      knownLangs,
+      knownLangs: knownLangsNow,
       targets,
       sent: translations.length,
+      provider: result.provider,
     });
 
     if (translations.length > 0) {
       await this.gateway.sendCombinedReply(sessionId, msg.chatId, msg.id, formatCombinedReply(translations));
     }
+    await this.maybeNotifyHealth(sessionId, state);
     await this.store.save(state);
+  }
+
+  /**
+   * Announce a provider health transition once per group, lazily on that group's next translated
+   * message (spec §11). The first sighting of a group since boot only records a baseline, so a
+   * restart never greets every group with a spurious "recovered" notice.
+   *
+   * Ordering: record the transition FIRST, then send. This is deliberately the opposite of
+   * `discloseIfNeeded`, and the two must not be "made consistent" with each other. This is a
+   * non-persisted convenience notice, so the failure to err away from is a repeat storm — every
+   * subsequent message re-announcing the same outage. Losing one notice to a failed send is cheap;
+   * the next transition still reports. `discloseIfNeeded` is a compliance notice and errs the other
+   * way. See its docblock.
+   */
+  private async maybeNotifyHealth(sessionId: string, state: GroupState): Promise<void> {
+    const key = `${sessionId}:${state.chatId}`;
+    const current = this.providerHealth();
+    const known = this.notifiedHealth.get(key);
+    if (!known) {
+      // First sighting of this group since boot: record a baseline, say nothing.
+      this.notifiedHealth.set(key, new Map(current.map(p => [p.name, p.healthy])));
+      return;
+    }
+    const privacy = this.effectivePrivacy(state);
+    for (const p of current) {
+      if (known.get(p.name) === p.healthy) continue;
+      // Record the transition even when the notice is suppressed below, so a local-only group
+      // never hears a stale "recovered" the moment it switches to cloud.
+      known.set(p.name, p.healthy);
+      if (p.external && privacy.mode === 'local') continue;
+      await this.gateway.sendText(sessionId, state.chatId, formatHealthNotice(p));
+    }
+  }
+
+  private remember(sessionId: string, chatId: string, author: string, lang: string, text: string): void {
+    this.context.append(sessionId, chatId, { author, lang, text, at: new Date().toISOString() });
+  }
+
+  /** Participant display names the provider must carry through untranslated. */
+  private glossary(state: GroupState, current?: string): string[] {
+    const names = Object.values(state.participants).map(p => p.pushName);
+    names.push(current);
+    return [...new Set(names.filter((n): n is string => typeof n === 'string' && n.length > 0))];
+  }
+
+  private effectivePrivacy(state: GroupState): EffectivePrivacy {
+    if (state.privacy) return { mode: state.privacy, source: 'group' };
+    return { mode: this.opts.defaultPrivacy ?? 'cloud', source: 'instance' };
+  }
+
+  private providerHealth(): ProviderHealth[] {
+    if (this.extras.providerHealth) return this.extras.providerHealth();
+    return [{ name: this.translator.name, external: this.translator.external, healthy: this.translator.isHealthy() }];
   }
 
   /** Distinct languages currently spoken by enabled participants. */
@@ -250,7 +404,27 @@ export class TranslationCoordinator {
       return;
     }
     if (cmd.name === 'status') {
-      await this.gateway.sendText(sessionId, msg.chatId, formatStatus(state, this.translator.isHealthy()));
+      await this.gateway.sendText(
+        sessionId,
+        msg.chatId,
+        formatStatus(state, this.providerHealth(), this.effectivePrivacy(state), this.extras.models?.currentModel()),
+      );
+      return;
+    }
+    // The *show* form of `privacy` is open to anyone; only the *set* form is admin-gated below.
+    if (cmd.name === 'privacy' && !cmd.privacy) {
+      await this.gateway.sendText(sessionId, msg.chatId, formatPrivacy(this.effectivePrivacy(state), this.opts.prefix));
+      return;
+    }
+    // `model` is instance-wide, not group-scoped: it answers to the operator allow-list only, so
+    // this gate deliberately sits BEFORE the group admin gate — a group admin is not an operator.
+    if (cmd.name === 'model') {
+      const isOperator = (this.opts.operatorWids ?? []).some(w => widEquals(w, msg.author));
+      if (!isOperator) {
+        await this.gateway.sendText(sessionId, msg.chatId, '⛔ Only the instance operator can use that command.');
+        return;
+      }
+      await this.handleModelCommand(sessionId, msg, cmd);
       return;
     }
 
@@ -280,9 +454,12 @@ export class TranslationCoordinator {
       case 'on':
         state.active = true;
         await this.confirm(sessionId, msg, '✅ Translation activated.', state);
+        await this.discloseIfNeeded(sessionId, state);
         return;
       case 'off':
         state.active = false;
+        // Drop the buffered conversation: it must not leak into a later re-activation.
+        this.context.clear(sessionId, msg.chatId);
         await this.confirm(sessionId, msg, '✅ Translation deactivated.', state);
         return;
       case 'setlang': {
@@ -336,7 +513,113 @@ export class TranslationCoordinator {
         );
         return;
       }
+      case 'privacy': {
+        state.privacy = cmd.privacy; // non-undefined here: the show form returned earlier
+        // Drop the buffered conversation: turns spoken under the previous privacy mode must not
+        // cross the boundary. Going local->cloud this is the whole point — the last ten turns were
+        // spoken while the group had explicitly opted out of external processing, and they would
+        // otherwise ship to the provider as `history` on the very next message. The disclosure does
+        // not cover them: it says messages *will be* sent, not that already-spoken ones are about
+        // to be. Cleared unconditionally rather than only on the flip to cloud: dropping history on
+        // cloud->local costs nothing and leaves no branch here to get wrong later.
+        this.context.clear(sessionId, msg.chatId);
+        await this.confirm(sessionId, msg, `✅ Privacy set to ${cmd.privacy} for this group.`, state);
+        await this.discloseIfNeeded(sessionId, state);
+        return;
+      }
     }
+  }
+
+  /**
+   * Post the cloud disclosure once per group, only when cloud translation is in effect (spec §10).
+   *
+   * Two conditions, not one. Cloud privacy mode alone is not enough: the disclosure is a compliance
+   * statement that messages may be sent to an external AI service, and the chain only contains an
+   * external provider when the operator has enabled one (`llmEnabled` plus an API key). With the
+   * shipped default the chain is LibreTranslate alone, and a cloud-mode group — which is every group,
+   * since `defaultPrivacy` is `cloud` — would otherwise be told its messages leave the instance when
+   * nothing external exists to send them to. A false compliance statement is worse than none, so the
+   * notice tracks what the chain can actually do.
+   *
+   * Ordering: send FIRST, then mark the group disclosed and persist. This is deliberately the
+   * opposite of `maybeNotifyHealth`, and the two must not be "made consistent" with each other.
+   * This is a compliance notice, so the failure to err away from is under-disclosing: persisting
+   * first would let one failed send permanently silence a notice the group never received. Leaving
+   * the flag unset means the next message retries, at worst costing a duplicate. `maybeNotifyHealth`
+   * is a non-persisted convenience notice and errs the other way. See its docblock.
+   */
+  private async discloseIfNeeded(sessionId: string, state: GroupState): Promise<void> {
+    if (state.privacyDisclosed || this.effectivePrivacy(state).mode !== 'cloud') return;
+    if (!this.providerHealth().some(p => p.external)) return;
+    await this.gateway.sendText(sessionId, state.chatId, buildDisclosureText(this.opts.prefix));
+    state.privacyDisclosed = true;
+    await this.store.save(state);
+  }
+
+  /** `/tr model [list|switch <id>]` — operator-only; the caller has already checked the allow-list. */
+  private async handleModelCommand(sessionId: string, msg: InboundMessage, cmd: ParsedCommand): Promise<void> {
+    const models = this.extras.models;
+    if (!models) {
+      await this.gateway.sendText(sessionId, msg.chatId, 'AI translator is not configured on this instance.');
+      return;
+    }
+    const action = cmd.modelAction ?? 'show';
+
+    if (action === 'show') {
+      await this.gateway.sendText(sessionId, msg.chatId, `🤖 Active model: ${models.currentModel()}`);
+      return;
+    }
+
+    if (action === 'list') {
+      try {
+        const catalog = await models.listModels();
+        await this.gateway.sendText(sessionId, msg.chatId, formatModelList(catalog, models.currentModel()));
+      } catch (err) {
+        this.logger.warn('model catalog unavailable', {
+          action: 'translation_model_catalog_failed',
+          error: String(err),
+        });
+        await this.replyError(sessionId, msg, '⚠️ Model catalog unavailable right now.');
+      }
+      return;
+    }
+
+    // switch
+    const id = cmd.modelId;
+    if (!id) return this.replyError(sessionId, msg, `Usage: ${this.opts.prefix} model switch <id>`);
+
+    // A null catalog means "could not verify", which is NOT the same as "not in the catalog":
+    // an unreachable provider must never turn a valid id into a rejection.
+    let catalog: string[] | null = null;
+    try {
+      catalog = (await models.listModels()).map(m => m.id);
+    } catch (err) {
+      this.logger.warn('model catalog unavailable; switching unverified', {
+        action: 'translation_model_catalog_failed',
+        error: String(err),
+      });
+    }
+    if (catalog && !catalog.includes(id)) {
+      const near = catalog.filter(m => m.includes(id) || id.includes(m)).slice(0, 5);
+      const hint = near.length > 0 ? `Did you mean: ${near.join(', ')}` : `Use ${this.opts.prefix} model list.`;
+      return this.replyError(sessionId, msg, `⚠️ Unknown model "${id}". ${hint}`);
+    }
+
+    models.setModel(id);
+    await this.extras.modelStore?.save({ model: id, updatedAt: new Date().toISOString(), updatedBy: msg.author });
+    this.logger.info('model switched', {
+      action: 'translation_model_switched',
+      model: id,
+      by: msg.author,
+      verified: catalog !== null,
+    });
+    await this.gateway.sendText(
+      sessionId,
+      msg.chatId,
+      catalog
+        ? `✅ Model switched to ${id}.`
+        : `✅ Model switched to ${id} (catalog unavailable, switched unverified).`,
+    );
   }
 
   private resolveTarget(msg: InboundMessage, target?: CommandTarget): string | null {

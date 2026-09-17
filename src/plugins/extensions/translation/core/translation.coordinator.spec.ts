@@ -1,8 +1,30 @@
 // src/modules/translation/core/translation.coordinator.spec.ts
-import { TranslationCoordinator, CoordinatorOptions } from './translation.coordinator';
-import { ChatGateway, ConfigStore, GroupState, InboundMessage, Translator, TranslationLogger } from './ports';
+import { TranslationCoordinator, CoordinatorOptions, CoordinatorExtras } from './translation.coordinator';
+import { OpenAiCompatibleClient } from '../llm-openai-compatible.client';
+import {
+  ChatGateway,
+  ConfigStore,
+  GroupState,
+  InboundMessage,
+  Translator,
+  TranslationLogger,
+  ContextualTranslator,
+  TranslateRequest,
+} from './ports';
+import { LibreTranslateContextual } from './libretranslate.contextual';
+import { ConversationContext } from './conversation-context';
 
 const OPTS: CoordinatorOptions = { prefix: '/tr', minLength: 2, maxLength: 2000, denyReply: false };
+
+/**
+ * A chain that actually has an external provider in it. The cloud disclosure requires this as well
+ * as cloud privacy mode, so any fixture exercising the disclosure has to declare it; the default
+ * `providerHealth` derives from the translator fake, which is `external: false` in these tests.
+ */
+const CLOUD_CHAIN = () => [
+  { name: 'llm', external: true, healthy: true },
+  { name: 'libretranslate', external: false, healthy: true },
+];
 
 function freshState(over: Partial<GroupState> = {}): GroupState {
   return {
@@ -38,12 +60,19 @@ function makeDeps(state: GroupState) {
   const gateway: ChatGateway = { sendText, sendCombinedReply, getGroupAdmins };
   const translator: Translator = { detect, translate, languages, isHealthy };
   const logger: TranslationLogger = { debug, info, warn };
+  // The coordinator now speaks `ContextualTranslator`; the legacy detect/translate fake reaches it
+  // through the same wrapper production uses, so `mocks.detect`/`mocks.translate` still drive it.
+  const contextual: ContextualTranslator = new LibreTranslateContextual(translator, logger);
+  const context = new ConversationContext({ maxTurns: 10, maxChars: 2000 });
+  const extras: CoordinatorExtras = { context };
 
   return {
     store,
     gateway,
-    translator,
+    translator: contextual,
     logger,
+    context,
+    extras,
     saved,
     mocks: {
       load,
@@ -345,5 +374,899 @@ describe('TranslationCoordinator', () => {
       'translate decision',
       expect.objectContaining({ detected: 'en', source: 'en', sent: 1 }),
     );
+  });
+
+  it('keeps every target on the message that confirms a learned-language switch', async () => {
+    // Regression: on the flip message the sender's pending language is not yet in `knownLanguages`,
+    // so without augmenting the provider request the wrapper translates FROM the stale hint and
+    // never produces the other English speaker's copy, which `targetLanguages` still demands.
+    const state = freshState({
+      announced: true,
+      active: true,
+      participants: {
+        '111@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 5, updatedAt: 'x' },
+        '222@c.us': { lang: 'es', source: 'learned', enabled: true, samples: 5, updatedAt: 'x' },
+        '333@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 5, updatedAt: 'x' },
+      },
+    });
+    const { store, gateway, translator, extras, mocks } = makeDeps(state);
+    mocks.detect.mockResolvedValue({ lang: 'fr', confidence: 0.99 });
+    mocks.translate.mockImplementation((_text: string, src: string, tgt: string) => Promise.resolve(`${src}->${tgt}`));
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, undefined, extras);
+
+    await c.handleMessage('s', msg({ author: '111@c.us', body: 'Bonjour' })); // arms pendingLang='fr'
+    await c.handleMessage('s', msg({ author: '111@c.us', body: 'Salut' })); // confirms the switch
+
+    const calls = mocks.sendCombinedReply.mock.calls as unknown[][];
+    // First message: nothing learned yet, so the pre-flip behaviour is unchanged.
+    expect(calls[0][3]).toBe('🇪🇸 ES: en->es');
+    // Flip message: both remaining languages served, and translated FROM the confirmed language.
+    const flip = calls[1][3] as string;
+    expect(flip).toContain('fr->es');
+    expect(flip).toContain('fr->en');
+  });
+
+  it('never delivers an unconfirmed pending language to the group', async () => {
+    // The pending language is offered to the provider only. The backstop must keep using the
+    // unaugmented known languages, or a guess nobody in the group speaks gets broadcast.
+    const state = freshState({
+      announced: true,
+      active: true,
+      participants: {
+        '111@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 5, updatedAt: 'x' },
+        '222@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 5, updatedAt: 'x' },
+      },
+    });
+    const { store, gateway, translator, extras, mocks } = makeDeps(state);
+    mocks.translate.mockImplementation((_text: string, src: string, tgt: string) => Promise.resolve(`${src}->${tgt}`));
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, undefined, extras);
+
+    mocks.detect.mockResolvedValue({ lang: 'fr', confidence: 0.99 });
+    await c.handleMessage('s', msg({ author: '111@c.us', body: 'Bonjour' })); // arms pendingLang='fr'
+    mocks.detect.mockResolvedValue({ lang: 'de', confidence: 0.99 });
+    await c.handleMessage('s', msg({ author: '111@c.us', body: 'Guten Tag' }));
+
+    // The group speaks only 'en'; 'fr' was never confirmed, so nothing is broadcast.
+    expect(mocks.sendCombinedReply).not.toHaveBeenCalled();
+  });
+
+  it('posts nothing when a confirming message abandons a language nobody else speaks', async () => {
+    // 111 is switching es -> en and 222 already speaks en, so once the switch is confirmed the
+    // group speaks only 'en' and there is nothing left to translate. The sanity rule and the
+    // backstop must therefore read the known languages recomputed AFTER `applyLearning`: if they
+    // read the pre-learning array they still see the abandoned 'es', the backstop fires, and the
+    // group gets a stray Spanish copy of a message every member can already read.
+    const state = freshState({
+      announced: true,
+      active: true,
+      participants: {
+        '111@c.us': {
+          lang: 'es',
+          source: 'learned',
+          enabled: true,
+          samples: 5,
+          updatedAt: 'x',
+          pendingLang: 'en', // one confirmation away from the switch
+        },
+        '222@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 5, updatedAt: 'x' },
+      },
+    });
+    const { store, gateway, translator, logger, saved, extras, mocks } = makeDeps(state);
+    mocks.detect.mockResolvedValue({ lang: 'en', confidence: 0.99 });
+    mocks.translate.mockImplementation((_text: string, src: string, tgt: string) => Promise.resolve(`${src}->${tgt}`));
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, logger, extras);
+
+    await c.handleMessage('s', msg({ author: '111@c.us', body: 'Sure, sounds good to me' }));
+
+    // The switch was learned...
+    expect(saved[saved.length - 1].participants['111@c.us'].lang).toBe('en');
+    // ...and nothing reached the group: no stray 'es' reply, and no misleading backstop warning.
+    expect(mocks.sendCombinedReply).not.toHaveBeenCalled();
+    expect(mocks.warn).not.toHaveBeenCalledWith(
+      'target backstop engaged (possible misroute or cross-language write)',
+      expect.anything(),
+    );
+    expect(mocks.debug).toHaveBeenCalledWith(
+      'no targets; group speaks only the source language',
+      expect.objectContaining({ action: 'translation_no_targets', source: 'en' }),
+    );
+  });
+
+  it('sends one contextual request with candidates, hint, glossary and prior history (excluding the current message)', async () => {
+    const state = freshState({
+      active: true,
+      announced: true,
+      participants: {
+        '111@c.us': { lang: 'es', source: 'learned', enabled: true, samples: 2, updatedAt: '', pushName: 'Ana' },
+        '222@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 2, updatedAt: '', pushName: 'Doug' },
+      },
+    });
+    const { store, gateway, context, extras, mocks } = makeDeps(state);
+    const translateAll = jest.fn().mockResolvedValue({
+      detected: 'es',
+      source: 'es',
+      translations: [{ lang: 'en', text: 'hi' }],
+      provider: 'llm',
+    });
+    const fake: ContextualTranslator = {
+      name: 'llm',
+      external: true,
+      translateAll,
+      languages: mocks.languages,
+      isHealthy: () => true,
+    };
+    context.append('s', 'g@g.us', { author: 'Doug', lang: 'en', text: 'earlier', at: 'x' });
+    const c = new TranslationCoordinator(fake, store, gateway, OPTS, undefined, extras);
+
+    await c.handleMessage('s', msg({ body: 'hola Doug', author: '111@c.us', pushName: 'Ana' }));
+
+    expect(translateAll).toHaveBeenCalledTimes(1);
+    const req = (translateAll.mock.calls as unknown[][])[0][0] as TranslateRequest;
+    expect(req).toMatchObject({
+      text: 'hola Doug',
+      senderName: 'Ana',
+      hintLang: 'es',
+      allowExternal: true,
+    });
+    expect([...req.candidateLangs].sort()).toEqual(['en', 'es']);
+    expect([...req.glossary].sort()).toEqual(['Ana', 'Doug']);
+    expect(req.history.map(t => t.text)).toEqual(['earlier']);
+    expect(mocks.sendCombinedReply).toHaveBeenCalledWith('s', 'g@g.us', 'M1', expect.stringContaining('hi'));
+    // The current message joins the buffer only AFTER the round-trip, so it is never its own context.
+    expect(context.get('s', 'g@g.us').map(t => t.text)).toEqual(['earlier', 'hola Doug']);
+    expect(context.get('s', 'g@g.us')[1]).toMatchObject({ author: 'Ana', lang: 'es' });
+  });
+
+  it('records an ignored participant message in context without translating it', async () => {
+    const state = freshState({
+      active: true,
+      announced: true,
+      participants: {
+        '111@c.us': { lang: 'es', source: 'learned', enabled: false, samples: 2, updatedAt: '' },
+      },
+    });
+    const { store, gateway, translator, context, extras, mocks } = makeDeps(state);
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, undefined, extras);
+    await c.handleMessage('s', msg({ body: 'hola', author: '111@c.us' }));
+    expect(mocks.detect).not.toHaveBeenCalled();
+    expect(context.get('s', 'g@g.us')).toEqual([expect.objectContaining({ text: 'hola', lang: 'es' })]);
+  });
+
+  it('still records the turn (lang und) when the provider fails, and stays silent', async () => {
+    const state = freshState({ active: true, announced: true });
+    const { store, gateway, translator, context, extras, mocks } = makeDeps(state);
+    mocks.detect.mockRejectedValue(new Error('down'));
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, undefined, extras);
+    await c.handleMessage('s', msg({ body: 'hola' }));
+    expect(mocks.sendCombinedReply).not.toHaveBeenCalled();
+    expect(context.get('s', 'g@g.us')).toEqual([expect.objectContaining({ text: 'hola', lang: 'und' })]);
+  });
+
+  it('clears the context on /tr off', async () => {
+    const state = freshState({ active: true, announced: true });
+    const { store, gateway, translator, context, extras, mocks } = makeDeps(state);
+    mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
+    context.append('s', 'g@g.us', { author: 'x', lang: 'en', text: 'old', at: 'x' });
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, undefined, extras);
+    await c.handleMessage('s', msg({ body: '/tr off' }));
+    expect(context.get('s', 'g@g.us')).toEqual([]);
+  });
+
+  it('filters provider translations down to the computed targets', async () => {
+    // Sender speaks es; en is the only computed target (the ru participant is ignored, so ru is
+    // neither a known language nor a target). The provider answers with en+ru anyway.
+    const state = freshState({
+      active: true,
+      announced: true,
+      participants: {
+        '111@c.us': { lang: 'es', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+        '222@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+        '333@c.us': { lang: 'ru', source: 'learned', enabled: false, samples: 2, updatedAt: '' },
+      },
+    });
+    const { store, gateway, extras, mocks } = makeDeps(state);
+    const translateAll = jest.fn().mockResolvedValue({
+      detected: 'es',
+      source: 'es',
+      translations: [
+        { lang: 'en', text: 'hi' },
+        { lang: 'ru', text: 'privet' },
+      ],
+      provider: 'llm',
+    });
+    const fake: ContextualTranslator = {
+      name: 'llm',
+      external: true,
+      translateAll,
+      languages: mocks.languages,
+      isHealthy: () => true,
+    };
+    const c = new TranslationCoordinator(fake, store, gateway, OPTS, undefined, extras);
+    await c.handleMessage('s', msg({ body: 'hola', author: '111@c.us' }));
+    const sent = (mocks.sendCombinedReply.mock.calls as unknown[][])[0][3] as string;
+    expect(sent).toContain('hi');
+    expect(sent).not.toContain('privet');
+  });
+
+  it('reports provider health, privacy and participants on /tr status', async () => {
+    const state = freshState({
+      active: true,
+      announced: true,
+      participants: {
+        '111@c.us': { lang: 'es', source: 'pinned', enabled: true, samples: 2, updatedAt: 'x' },
+      },
+    });
+    const { store, gateway, translator, extras, mocks } = makeDeps(state);
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, undefined, extras);
+    await c.handleMessage('s', msg({ body: '/tr status' }));
+    const sent = (mocks.sendText.mock.calls as unknown[][])[0][2] as string;
+    expect(sent).toContain('Translation: ACTIVE');
+    // No `providerHealth` override: exercises the CoordinatorExtras fallback, which reports the
+    // wired translator (the LibreTranslate wrapper) and therefore no LLM.
+    expect(sent).toContain('AI translator: disabled');
+    expect(sent).toContain('Basic translator (libretranslate): ok');
+    expect(sent).toContain('Privacy: cloud (instance default)');
+    expect(sent).toContain('• 111@c.us: es (pinned)');
+  });
+
+  it('reports the active model on /tr status when a model-switchable provider is configured', async () => {
+    const state = freshState({ active: true, announced: true, privacy: 'cloud' });
+    const { store, gateway, translator, context, mocks } = makeDeps(state);
+    const extras: CoordinatorExtras = {
+      context,
+      models: { listModels: jest.fn().mockResolvedValue([]), currentModel: () => 'grok-4-fast', setModel: jest.fn() },
+      providerHealth: () => [
+        { name: 'llm', external: true, healthy: true },
+        { name: 'libretranslate', external: false, healthy: false },
+      ],
+    };
+    const c = new TranslationCoordinator(translator, store, gateway, OPTS, undefined, extras);
+    await c.handleMessage('s', msg({ body: '/tr status' }));
+    const sent = (mocks.sendText.mock.calls as unknown[][])[0][2] as string;
+    expect(sent).toContain('AI translator (grok-4-fast): ok');
+    expect(sent).toContain('Basic translator (libretranslate): unreachable');
+    expect(sent).toContain('Privacy: cloud (group override)');
+  });
+
+  describe('privacy', () => {
+    it('forces allowExternal=false when the group is local', async () => {
+      const state = freshState({ active: true, announced: true, privacy: 'local' });
+      const { store, gateway, extras, mocks } = makeDeps(state);
+      const translateAll = jest
+        .fn()
+        .mockResolvedValue({ detected: 'es', source: 'es', translations: [], provider: 'libretranslate' });
+      const fake: ContextualTranslator = {
+        name: 'chain',
+        external: false,
+        translateAll,
+        languages: mocks.languages,
+        isHealthy: () => true,
+      };
+      const c = new TranslationCoordinator(fake, store, gateway, OPTS, undefined, extras);
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      const req = (translateAll.mock.calls as unknown[][])[0][0] as TranslateRequest;
+      expect(req.allowExternal).toBe(false);
+    });
+
+    it('uses the instance default when the group has no override', async () => {
+      const state = freshState({ active: true, announced: true });
+      const { store, gateway, extras, mocks } = makeDeps(state);
+      const translateAll = jest
+        .fn()
+        .mockResolvedValue({ detected: 'es', source: 'es', translations: [], provider: 'libretranslate' });
+      const fake: ContextualTranslator = {
+        name: 'chain',
+        external: false,
+        translateAll,
+        languages: mocks.languages,
+        isHealthy: () => true,
+      };
+      const c = new TranslationCoordinator(
+        fake,
+        store,
+        gateway,
+        { ...OPTS, defaultPrivacy: 'local' },
+        undefined,
+        extras,
+      );
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      const req = (translateAll.mock.calls as unknown[][])[0][0] as TranslateRequest;
+      expect(req.allowExternal).toBe(false);
+    });
+
+    it('/tr privacy is open to anyone and shows the effective mode', async () => {
+      const state = freshState({ announced: true });
+      const { store, gateway, translator, mocks } = makeDeps(state);
+      const c = new TranslationCoordinator(translator, store, gateway, OPTS);
+      await c.handleMessage('s', msg({ body: '/tr privacy' }));
+      expect(mocks.getGroupAdmins).not.toHaveBeenCalled();
+      expect(mocks.sendText).toHaveBeenCalledWith('s', 'g@g.us', expect.stringContaining('cloud (instance default)'));
+    });
+
+    it('/tr privacy local is admin-gated and persists the override', async () => {
+      const state = freshState({ announced: true });
+      const { store, gateway, translator, saved, mocks } = makeDeps(state);
+      const c = new TranslationCoordinator(translator, store, gateway, OPTS);
+      await c.handleMessage('s', msg({ body: '/tr privacy local' }));
+      expect(mocks.sendText).toHaveBeenLastCalledWith('s', 'g@g.us', expect.stringMatching(/⛔/));
+      mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
+      await c.handleMessage('s', msg({ body: '/tr privacy local' }));
+      expect(saved[saved.length - 1].privacy).toBe('local');
+      expect(mocks.sendText).toHaveBeenLastCalledWith('s', 'g@g.us', expect.stringContaining('local'));
+    });
+
+    it('discloses cloud use exactly once: on /tr on, not again on a later /tr on', async () => {
+      const state = freshState({ announced: true });
+      const { store, gateway, translator, saved, mocks } = makeDeps(state);
+      mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
+      const c = new TranslationCoordinator(translator, store, gateway, OPTS, undefined, {
+        providerHealth: CLOUD_CHAIN,
+      });
+      await c.handleMessage('s', msg({ body: '/tr on' }));
+      const disclosures = () =>
+        (mocks.sendText.mock.calls as unknown[][]).filter(call => /external AI/i.test(call[2] as string));
+      expect(disclosures()).toHaveLength(1);
+      expect(saved[saved.length - 1].privacyDisclosed).toBe(true);
+      await c.handleMessage('s', msg({ body: '/tr on' }));
+      expect(disclosures()).toHaveLength(1);
+    });
+
+    it('does not disclose on /tr on in a local group, but does when switched to cloud', async () => {
+      const state = freshState({ announced: true, privacy: 'local' });
+      const { store, gateway, translator, mocks } = makeDeps(state);
+      mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
+      const c = new TranslationCoordinator(translator, store, gateway, OPTS, undefined, {
+        providerHealth: CLOUD_CHAIN,
+      });
+      const disclosures = () =>
+        (mocks.sendText.mock.calls as unknown[][]).filter(call => /external AI/i.test(call[2] as string));
+      await c.handleMessage('s', msg({ body: '/tr on' }));
+      expect(disclosures()).toHaveLength(0);
+      await c.handleMessage('s', msg({ body: '/tr privacy cloud' }));
+      expect(disclosures()).toHaveLength(1);
+    });
+  });
+
+  describe('health notices', () => {
+    function healthDeps(state: GroupState) {
+      const deps = makeDeps(state);
+      const health = { llm: true, lt: true };
+      const providerHealth = () => [
+        { name: 'llm', external: true, healthy: health.llm },
+        { name: 'libretranslate', external: false, healthy: health.lt },
+      ];
+      const translateAll = jest.fn().mockResolvedValue({
+        detected: 'es',
+        source: 'es',
+        translations: [{ lang: 'en', text: 'hi' }],
+        provider: 'llm',
+      });
+      const fake: ContextualTranslator = {
+        name: 'chain',
+        external: false,
+        translateAll,
+        languages: deps.mocks.languages,
+        isHealthy: () => true,
+      };
+      const c = new TranslationCoordinator(fake, deps.store, deps.gateway, OPTS, undefined, {
+        ...deps.extras,
+        providerHealth,
+      });
+      const notices = () =>
+        (deps.mocks.sendText.mock.calls as unknown[][])
+          .map(call => call[2] as string)
+          .filter(t => /AI translation/.test(t));
+      return { c, health, notices, mocks: deps.mocks };
+    }
+    const active = () =>
+      freshState({
+        active: true,
+        announced: true,
+        participants: {
+          '111@c.us': { lang: 'es', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+          '222@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+        },
+      });
+
+    it('posts one degraded notice per transition, after the reply, and one recovery notice', async () => {
+      const { c, health, notices, mocks } = healthDeps(active());
+      await c.handleMessage('s', msg({ body: 'hola' })); // baseline, no notice
+      expect(notices()).toEqual([]);
+      health.llm = false;
+      await c.handleMessage('s', msg({ body: 'hola otra' }));
+      expect(notices()).toEqual([
+        '⚠️ AI translation is temporarily unavailable; using basic translation until it recovers.',
+      ]);
+      const replyOrder = mocks.sendCombinedReply.mock.invocationCallOrder[1];
+      const noticeOrder = mocks.sendText.mock.invocationCallOrder[mocks.sendText.mock.calls.length - 1];
+      expect(replyOrder).toBeLessThan(noticeOrder);
+      await c.handleMessage('s', msg({ body: 'hola tres' }));
+      expect(notices()).toHaveLength(1);
+      health.llm = true;
+      await c.handleMessage('s', msg({ body: 'hola cuatro' }));
+      expect(notices()).toEqual([
+        '⚠️ AI translation is temporarily unavailable; using basic translation until it recovers.',
+        '✅ AI translation is back.',
+      ]);
+    });
+
+    it('never mentions the external provider in a local-only group', async () => {
+      const { c, health, notices } = healthDeps({ ...active(), privacy: 'local' });
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      health.llm = false;
+      await c.handleMessage('s', msg({ body: 'hola otra' }));
+      expect(notices()).toEqual([]);
+    });
+  });
+
+  describe('model commands', () => {
+    function modelDeps(operatorWids: string[]) {
+      const deps = makeDeps(freshState({ announced: true }));
+      let model = 'grok-a';
+      const catalog = [
+        { id: 'grok-a', inputPerMTok: 1.25, outputPerMTok: 2.5 },
+        { id: 'grok-b', inputPerMTok: 2, outputPerMTok: 6 },
+      ];
+      const listModels = jest.fn().mockResolvedValue(catalog);
+      const models = { listModels, currentModel: () => model, setModel: (id: string) => void (model = id) };
+      const save = jest.fn().mockResolvedValue(undefined);
+      const modelStore = { load: jest.fn().mockResolvedValue(null), save };
+      const c = new TranslationCoordinator(
+        deps.translator,
+        deps.store,
+        deps.gateway,
+        { ...OPTS, operatorWids },
+        undefined,
+        {
+          ...deps.extras,
+          models,
+          modelStore,
+        },
+      );
+      return { c, mocks: deps.mocks, listModels, save, current: () => model };
+    }
+
+    const lastText = (mocks: { sendText: jest.Mock }) =>
+      (mocks.sendText.mock.calls as unknown[][])[mocks.sendText.mock.calls.length - 1][2] as string;
+
+    /**
+     * Like `modelDeps`, but the `models` port is a REAL `OpenAiCompatibleClient` over a mocked
+     * catalog that DOES contain a non-text model. The point is that the model's absence downstream
+     * has to be produced by the client's modality filter rather than by the fixture — a test whose
+     * fixture never held the offending id could not fail under any regression.
+     */
+    function realClientModelDeps(operatorWids: string[]) {
+      const deps = makeDeps(freshState({ announced: true }));
+      global.fetch = jest.fn<Promise<unknown>, [string, RequestInit?]>().mockImplementation((url: string) =>
+        Promise.resolve(
+          url.endsWith('/language-models')
+            ? {
+                ok: true,
+                status: 200,
+                json: () =>
+                  Promise.resolve({
+                    models: [
+                      {
+                        id: 'grok-4.6',
+                        output_modalities: ['text'],
+                        prompt_text_token_price: 20000,
+                        completion_text_token_price: 60000,
+                      },
+                      { id: 'grok-imagine-video', output_modalities: ['video'] },
+                    ],
+                  }),
+              }
+            : { ok: true, status: 200, json: () => Promise.resolve({ data: [] }) },
+        ),
+      ) as never;
+      const models = new OpenAiCompatibleClient({
+        baseUrl: 'https://api.x.ai/v1',
+        apiKey: 'k',
+        model: 'grok-4.6',
+        timeoutMs: 1000,
+      });
+      const save = jest.fn().mockResolvedValue(undefined);
+      const c = new TranslationCoordinator(
+        deps.translator,
+        deps.store,
+        deps.gateway,
+        { ...OPTS, operatorWids },
+        undefined,
+        { ...deps.extras, models, modelStore: { load: jest.fn().mockResolvedValue(null), save } },
+      );
+      return { c, mocks: deps.mocks, save, models };
+    }
+
+    const originalFetch = global.fetch;
+    afterEach(() => {
+      global.fetch = originalFetch;
+    });
+
+    it('denies non-operators, even group admins', async () => {
+      const { c, mocks } = modelDeps(['999@c.us']);
+      mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
+      await c.handleMessage('s', msg({ body: '/tr model list' }));
+      expect(mocks.sendText).toHaveBeenLastCalledWith(
+        's',
+        'g@g.us',
+        '⛔ Only the instance operator can use that command.',
+      );
+    });
+
+    it('shows the active model for an operator (device-suffixed author tolerated)', async () => {
+      const { c, mocks } = modelDeps(['111@c.us']);
+      await c.handleMessage('s', msg({ body: '/tr model', author: '111:7@c.us' }));
+      expect(mocks.sendText).toHaveBeenLastCalledWith('s', 'g@g.us', expect.stringContaining('grok-a'));
+    });
+
+    it('lists models with prices and the active marker', async () => {
+      const { c, mocks } = modelDeps(['111@c.us']);
+      await c.handleMessage('s', msg({ body: '/tr model list' }));
+      const out = (mocks.sendText.mock.calls as unknown[][])[mocks.sendText.mock.calls.length - 1][2] as string;
+      expect(out).toContain('▶ grok-a — in $1.25 / out $2.50 per 1M tok');
+      expect(out).toContain('• grok-b — in $2.00 / out $6.00 per 1M tok');
+    });
+
+    it('switches to a known model and persists it', async () => {
+      const { c, mocks, save, current } = modelDeps(['111@c.us']);
+      await c.handleMessage('s', msg({ body: '/tr model switch grok-b' }));
+      expect(current()).toBe('grok-b');
+      expect(save).toHaveBeenCalledWith(expect.objectContaining({ model: 'grok-b', updatedBy: '111@c.us' }));
+      expect(mocks.sendText).toHaveBeenLastCalledWith('s', 'g@g.us', '✅ Model switched to grok-b.');
+    });
+
+    it('rejects an unknown model with suggestions and does not switch', async () => {
+      const { c, mocks, save, current } = modelDeps(['111@c.us']);
+      await c.handleMessage('s', msg({ body: '/tr model switch grok' }));
+      expect(current()).toBe('grok-a');
+      expect(save).not.toHaveBeenCalled();
+      const out = (mocks.sendText.mock.calls as unknown[][])[mocks.sendText.mock.calls.length - 1][2] as string;
+      expect(out).toMatch(/Unknown model "grok"/);
+      expect(out).toContain('grok-a');
+      expect(out).toContain('grok-b');
+    });
+
+    it('refuses a switch to a model the provider declares as non-text', async () => {
+      // End-to-end guarantee: the client's modality filter is what makes the video model a
+      // non-member, so it falls through the pre-existing unknown-model path instead of being
+      // accepted and persisted. Remove `.filter(isTextCapable)` and this test fails.
+      const { c, mocks, save, models } = realClientModelDeps(['111@c.us']);
+      await c.handleMessage('s', msg({ body: '/tr model switch grok-imagine-video' }));
+      expect(models.currentModel()).toBe('grok-4.6');
+      expect(save).not.toHaveBeenCalled();
+      const out = lastText(mocks);
+      expect(out).toMatch(/Unknown model "grok-imagine-video"/);
+      // The nearest-match hint draws from the filtered catalog, so it cannot suggest one back.
+      expect(out).toContain('Use /tr model list.');
+    });
+
+    it('never offers a model the provider declares as non-text in the list', async () => {
+      const { c, mocks } = realClientModelDeps(['111@c.us']);
+      await c.handleMessage('s', msg({ body: '/tr model list' }));
+      const out = lastText(mocks);
+      expect(out).toContain('grok-4.6'); // the fixture did reach the coordinator...
+      expect(out).not.toContain('grok-imagine-video'); // ...and the filter is what removed this one
+    });
+
+    it('switches unverified when the catalog is unavailable', async () => {
+      const { c, mocks, listModels, current } = modelDeps(['111@c.us']);
+      listModels.mockRejectedValue(new Error('HTTP 500'));
+      await c.handleMessage('s', msg({ body: '/tr model switch anything' }));
+      expect(current()).toBe('anything');
+      expect(mocks.sendText).toHaveBeenLastCalledWith('s', 'g@g.us', expect.stringMatching(/unverified/));
+    });
+
+    it('reports a catalog failure on list', async () => {
+      const { c, mocks, listModels } = modelDeps(['111@c.us']);
+      listModels.mockRejectedValue(new Error('HTTP 500'));
+      await c.handleMessage('s', msg({ body: '/tr model list' }));
+      expect(mocks.sendText).toHaveBeenLastCalledWith('s', 'g@g.us', '⚠️ Model catalog unavailable right now.');
+    });
+
+    it('replies usage when switch has no id', async () => {
+      const { c, mocks } = modelDeps(['111@c.us']);
+      await c.handleMessage('s', msg({ body: '/tr model switch' }));
+      expect(mocks.sendText).toHaveBeenLastCalledWith(
+        's',
+        'g@g.us',
+        expect.stringContaining('Usage: /tr model switch <id>'),
+      );
+    });
+
+    it('reports not configured when there is no switchable provider', async () => {
+      const deps = makeDeps(freshState({ announced: true }));
+      const c = new TranslationCoordinator(deps.translator, deps.store, deps.gateway, {
+        ...OPTS,
+        operatorWids: ['111@c.us'],
+      });
+      await c.handleMessage('s', msg({ body: '/tr model' }));
+      expect(deps.mocks.sendText).toHaveBeenLastCalledWith(
+        's',
+        'g@g.us',
+        'AI translator is not configured on this instance.',
+      );
+    });
+  });
+
+  describe('disclosure on the translate path', () => {
+    const cloudActive = () =>
+      freshState({
+        active: true,
+        announced: true,
+        participants: {
+          '111@c.us': { lang: 'es', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+          '222@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+        },
+      });
+
+    function translateDeps(state: GroupState) {
+      const deps = makeDeps(state);
+      const translateAll = jest.fn().mockResolvedValue({
+        detected: 'es',
+        source: 'es',
+        translations: [{ lang: 'en', text: 'hi' }],
+        provider: 'llm',
+      });
+      const fake: ContextualTranslator = {
+        name: 'chain',
+        external: false,
+        translateAll,
+        languages: deps.mocks.languages,
+        isHealthy: () => true,
+      };
+      // The mocked result claims `provider: 'llm'`, so the chain this fixture stands for has an
+      // external provider in it; the disclosure now requires that to be declared.
+      const c = new TranslationCoordinator(fake, deps.store, deps.gateway, OPTS, undefined, {
+        ...deps.extras,
+        providerHealth: CLOUD_CHAIN,
+      });
+      const disclosures = () =>
+        (deps.mocks.sendText.mock.calls as unknown[][]).filter(call => /external AI/i.test(call[2] as string));
+      return { c, translateAll, disclosures, mocks: deps.mocks, saved: deps.saved };
+    }
+
+    it('discloses to an already-active group on its next translated message, exactly once', async () => {
+      const state = cloudActive();
+      const { c, disclosures, saved } = translateDeps(state);
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      expect(disclosures()).toHaveLength(1);
+      expect(saved[saved.length - 1].privacyDisclosed).toBe(true);
+      await c.handleMessage('s', msg({ body: 'hola otra' }));
+      expect(disclosures()).toHaveLength(1);
+    });
+
+    it('discloses before the text is handed to the provider', async () => {
+      const { c, translateAll, mocks } = translateDeps(cloudActive());
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      const discloseOrder = mocks.sendText.mock.invocationCallOrder[0];
+      expect(translateAll.mock.invocationCallOrder[0]).toBeGreaterThan(discloseOrder);
+    });
+
+    it('never discloses on the translate path in a local-only group', async () => {
+      const { c, disclosures } = translateDeps({ ...cloudActive(), privacy: 'local' });
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      expect(disclosures()).toHaveLength(0);
+    });
+
+    it('still discloses when the translation itself fails', async () => {
+      const { c, translateAll, disclosures } = translateDeps(cloudActive());
+      translateAll.mockRejectedValue(new Error('all providers down'));
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      expect(disclosures()).toHaveLength(1);
+    });
+
+    it('retries the disclosure when the send fails, leaving the group undisclosed', async () => {
+      const state = cloudActive();
+      const { c, disclosures, mocks, saved } = translateDeps(state);
+      mocks.sendText.mockImplementation((_s: string, _c: string, text: string) =>
+        /external AI/i.test(text) ? Promise.reject(new Error('offline')) : Promise.resolve(undefined),
+      );
+      await expect(c.handleMessage('s', msg({ body: 'hola' }))).rejects.toThrow('offline');
+      expect(state.privacyDisclosed).toBeUndefined();
+      expect(saved.some(s => s.privacyDisclosed === true)).toBe(false);
+
+      mocks.sendText.mockResolvedValue(undefined);
+      await c.handleMessage('s', msg({ body: 'hola otra' }));
+      expect(disclosures()).toHaveLength(2); // the failed attempt plus the retry
+      expect(state.privacyDisclosed).toBe(true);
+      expect(saved[saved.length - 1].privacyDisclosed).toBe(true);
+    });
+  });
+
+  // The disclosure is a compliance statement ("your messages may go to an external AI service"). It
+  // must track what the chain can actually do, not just the group's privacy mode: with `llmEnabled`
+  // false the chain holds LibreTranslate alone, and a cloud-mode group would otherwise be told its
+  // messages leave the instance when nothing external exists to send them to.
+  describe('disclosure is gated on an external provider being present', () => {
+    const LOCAL_ONLY = () => [{ name: 'libretranslate', external: false, healthy: true }];
+    const WITH_EXTERNAL = () => [
+      { name: 'llm', external: true, healthy: true },
+      { name: 'libretranslate', external: false, healthy: true },
+    ];
+
+    const cloudActive = () =>
+      freshState({
+        active: true,
+        announced: true,
+        participants: {
+          '111@c.us': { lang: 'es', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+          '222@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+        },
+      });
+
+    function deps(state: GroupState, providerHealth: () => ReturnType<typeof LOCAL_ONLY>) {
+      const d = makeDeps(state);
+      const translateAll = jest.fn().mockResolvedValue({
+        detected: 'es',
+        source: 'es',
+        translations: [{ lang: 'en', text: 'hi' }],
+        provider: 'llm',
+      });
+      const fake: ContextualTranslator = {
+        name: 'chain',
+        external: false,
+        translateAll,
+        languages: d.mocks.languages,
+        isHealthy: () => true,
+      };
+      d.mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
+      const c = new TranslationCoordinator(fake, d.store, d.gateway, OPTS, undefined, {
+        ...d.extras,
+        providerHealth,
+      });
+      const disclosures = () =>
+        (d.mocks.sendText.mock.calls as unknown[][]).filter(call => /external AI/i.test(call[2] as string));
+      return { c, disclosures };
+    }
+
+    it('says nothing to a cloud-mode group when the chain is LibreTranslate-only (/tr on)', async () => {
+      const { c, disclosures } = deps(freshState({ announced: true }), LOCAL_ONLY);
+      await c.handleMessage('s', msg({ body: '/tr on' }));
+      expect(disclosures()).toHaveLength(0);
+    });
+
+    it('says nothing to a cloud-mode group when the chain is LibreTranslate-only (translate path)', async () => {
+      const { c, disclosures } = deps(cloudActive(), LOCAL_ONLY);
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      expect(disclosures()).toHaveLength(0);
+    });
+
+    it('discloses exactly once once an external provider is in the chain (/tr on)', async () => {
+      const { c, disclosures } = deps(freshState({ announced: true }), WITH_EXTERNAL);
+      await c.handleMessage('s', msg({ body: '/tr on' }));
+      expect(disclosures()).toHaveLength(1);
+    });
+
+    it('discloses exactly once once an external provider is in the chain (translate path)', async () => {
+      const { c, disclosures } = deps(cloudActive(), WITH_EXTERNAL);
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      expect(disclosures()).toHaveLength(1);
+      await c.handleMessage('s', msg({ body: 'hola otra' }));
+      expect(disclosures()).toHaveLength(1);
+    });
+  });
+
+  describe('health notices on the outage path', () => {
+    function outageDeps(state: GroupState) {
+      const deps = makeDeps(state);
+      const health = { llm: true, lt: true };
+      const providerHealth = () => [
+        { name: 'llm', external: true, healthy: health.llm },
+        { name: 'libretranslate', external: false, healthy: health.lt },
+      ];
+      const translateAll = jest.fn().mockResolvedValue({
+        detected: 'es',
+        source: 'es',
+        translations: [{ lang: 'en', text: 'hi' }],
+        provider: 'llm',
+      });
+      const fake: ContextualTranslator = {
+        name: 'chain',
+        external: false,
+        translateAll,
+        languages: deps.mocks.languages,
+        isHealthy: () => true,
+      };
+      const c = new TranslationCoordinator(fake, deps.store, deps.gateway, OPTS, undefined, {
+        ...deps.extras,
+        providerHealth,
+      });
+      const notices = () =>
+        (deps.mocks.sendText.mock.calls as unknown[][])
+          .map(call => call[2] as string)
+          .filter(t => /AI translation/.test(t));
+      return { c, health, notices, translateAll };
+    }
+    const active = () =>
+      freshState({
+        active: true,
+        announced: true,
+        participants: {
+          '111@c.us': { lang: 'es', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+          '222@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+        },
+      });
+
+    it('announces the outage when every provider fails, not just on the happy path', async () => {
+      const { c, health, notices, translateAll } = outageDeps(active());
+      await c.handleMessage('s', msg({ body: 'hola' })); // baseline, no notice
+      expect(notices()).toEqual([]);
+      health.llm = false;
+      translateAll.mockRejectedValue(new Error('all providers down'));
+      await c.handleMessage('s', msg({ body: 'hola otra' }));
+      expect(notices()).toEqual([
+        '⚠️ AI translation is temporarily unavailable; using basic translation until it recovers.',
+      ]);
+    });
+
+    it('stays silent about the outage in a local-only group', async () => {
+      const { c, health, notices, translateAll } = outageDeps({ ...active(), privacy: 'local' });
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      health.llm = false;
+      translateAll.mockRejectedValue(new Error('all providers down'));
+      await c.handleMessage('s', msg({ body: 'hola otra' }));
+      expect(notices()).toEqual([]);
+    });
+  });
+
+  describe('privacy switch and the conversation buffer', () => {
+    function bufferDeps(state: GroupState) {
+      const deps = makeDeps(state);
+      const translateAll = jest.fn().mockResolvedValue({
+        detected: 'es',
+        source: 'es',
+        translations: [{ lang: 'en', text: 'hi' }],
+        provider: 'libretranslate',
+      });
+      const fake: ContextualTranslator = {
+        name: 'chain',
+        external: false,
+        translateAll,
+        languages: deps.mocks.languages,
+        isHealthy: () => true,
+      };
+      const c = new TranslationCoordinator(fake, deps.store, deps.gateway, OPTS, undefined, deps.extras);
+      const requestAt = (i: number) => (translateAll.mock.calls as unknown[][])[i][0] as TranslateRequest;
+      return { c, requestAt, mocks: deps.mocks };
+    }
+    const localActive = () =>
+      freshState({
+        active: true,
+        announced: true,
+        privacy: 'local',
+        participants: {
+          '111@c.us': { lang: 'es', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+          '222@c.us': { lang: 'en', source: 'learned', enabled: true, samples: 2, updatedAt: '' },
+        },
+      });
+
+    it('does not ship the local-era history to the provider after switching to cloud', async () => {
+      const { c, requestAt, mocks } = bufferDeps(localActive());
+      mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      await c.handleMessage('s', msg({ body: 'que tal' }));
+      // Guard against a vacuous assertion: the buffer really did fill up while the group was local.
+      expect(requestAt(1).history.length).toBeGreaterThan(0);
+      expect(requestAt(1).allowExternal).toBe(false);
+
+      await c.handleMessage('s', msg({ body: '/tr privacy cloud' }));
+
+      await c.handleMessage('s', msg({ body: 'hello again' }));
+      expect(requestAt(2).allowExternal).toBe(true);
+      expect(requestAt(2).history).toEqual([]);
+    });
+
+    it('also clears the buffer on a cloud to local switch', async () => {
+      const { c, requestAt, mocks } = bufferDeps({ ...localActive(), privacy: 'cloud' });
+      mocks.getGroupAdmins.mockResolvedValue(['111@c.us']);
+      await c.handleMessage('s', msg({ body: 'hola' }));
+      await c.handleMessage('s', msg({ body: 'que tal' }));
+      expect(requestAt(1).history.length).toBeGreaterThan(0);
+
+      await c.handleMessage('s', msg({ body: '/tr privacy local' }));
+
+      await c.handleMessage('s', msg({ body: 'hello again' }));
+      expect(requestAt(2).history).toEqual([]);
+    });
   });
 });
