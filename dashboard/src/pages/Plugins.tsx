@@ -71,6 +71,8 @@ export default function Plugins() {
     browserArgs: '--no-sandbox --disable-gpu',
   });
   const [savingConfig, setSavingConfig] = useState(false);
+  // Values for a schema-driven (non-engine) plugin's config form, keyed by configSchema property.
+  const [schemaConfig, setSchemaConfig] = useState<Record<string, unknown>>({});
 
   const refetchAll = () => {
     void queryClient.invalidateQueries({ queryKey: queryKeys.plugins });
@@ -112,7 +114,30 @@ export default function Plugins() {
 
   const handleOpenConfig = (plugin: Plugin) => {
     setConfigPlugin(plugin);
+    // Seed the schema form from the plugin's saved config, falling back to each field's default.
+    if (plugin.configSchema?.properties) {
+      const initial: Record<string, unknown> = {};
+      for (const [key, field] of Object.entries(plugin.configSchema.properties)) {
+        initial[key] = plugin.config[key] ?? field.default ?? (field.type === 'boolean' ? false : '');
+      }
+      setSchemaConfig(initial);
+    }
     setShowConfigModal(true);
+  };
+
+  const handleSaveSchemaConfig = async () => {
+    if (!configPlugin) return;
+    setSavingConfig(true);
+    try {
+      await pluginsApi.updateConfig(configPlugin.id, schemaConfig);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.plugins });
+      toast.success(t('plugins.toasts.savedTitle'), t('plugins.toasts.savedDesc'));
+      setShowConfigModal(false);
+    } catch (err) {
+      toast.error(t('plugins.toasts.saveFailed'), err instanceof Error ? err.message : t('common.unknownError'));
+    } finally {
+      setSavingConfig(false);
+    }
   };
 
   const handleSaveConfig = async () => {
@@ -401,6 +426,79 @@ export default function Plugins() {
                     </div>
                   </div>
                 </>
+              ) : configPlugin.configSchema && Object.keys(configPlugin.configSchema.properties).length > 0 ? (
+                <div className="config-form">
+                  {Object.entries(configPlugin.configSchema.properties).map(([key, field]) => {
+                    const value = schemaConfig[key];
+                    const label = field.title || key;
+
+                    if (field.type === 'boolean') {
+                      return (
+                        <div className="form-group toggle-group" key={key}>
+                          <div className="toggle-info">
+                            <label>{label}</label>
+                            {field.description && <small>{field.description}</small>}
+                          </div>
+                          <label className="toggle-switch">
+                            <input
+                              type="checkbox"
+                              checked={Boolean(value)}
+                              onChange={e => setSchemaConfig({ ...schemaConfig, [key]: e.target.checked })}
+                            />
+                            <span className="toggle-slider"></span>
+                          </label>
+                        </div>
+                      );
+                    }
+
+                    if (field.enum && field.enum.length > 0) {
+                      return (
+                        <div className="form-group" key={key}>
+                          <label>{label}</label>
+                          <select
+                            value={String(value ?? '')}
+                            onChange={e => setSchemaConfig({ ...schemaConfig, [key]: e.target.value })}
+                          >
+                            {field.enum.map(opt => (
+                              <option key={String(opt)} value={String(opt)}>
+                                {String(opt)}
+                              </option>
+                            ))}
+                          </select>
+                          {field.description && <small>{field.description}</small>}
+                        </div>
+                      );
+                    }
+
+                    const inputType = field.type === 'number' ? 'number' : field.secret ? 'password' : 'text';
+                    return (
+                      <div className="form-group" key={key}>
+                        <label>
+                          {label}
+                          {field.required && <span className="required-mark"> *</span>}
+                        </label>
+                        <input
+                          type={inputType}
+                          value={value === undefined || value === null ? '' : String(value)}
+                          placeholder={field.default !== undefined ? String(field.default) : undefined}
+                          autoComplete={field.secret ? 'new-password' : undefined}
+                          onChange={e =>
+                            setSchemaConfig({
+                              ...schemaConfig,
+                              [key]:
+                                field.type === 'number'
+                                  ? e.target.value === ''
+                                    ? ''
+                                    : Number(e.target.value)
+                                  : e.target.value,
+                            })
+                          }
+                        />
+                        {field.description && <small>{field.description}</small>}
+                      </div>
+                    );
+                  })}
+                </div>
               ) : (
                 <div className="no-config">
                   <Settings size={48} style={{ opacity: 0.3 }} />
@@ -413,11 +511,15 @@ export default function Plugins() {
               <button className="btn-secondary" onClick={() => setShowConfigModal(false)}>
                 {t('common.cancel')}
               </button>
-              {configPlugin.type === 'engine' && (
+              {configPlugin.type === 'engine' ? (
                 <button className="btn-primary" onClick={handleSaveConfig} disabled={savingConfig}>
                   {savingConfig ? <Loader2 size={16} className="animate-spin" /> : t('plugins.config.save')}
                 </button>
-              )}
+              ) : configPlugin.configSchema && Object.keys(configPlugin.configSchema.properties).length > 0 ? (
+                <button className="btn-primary" onClick={handleSaveSchemaConfig} disabled={savingConfig}>
+                  {savingConfig ? <Loader2 size={16} className="animate-spin" /> : t('plugins.config.save')}
+                </button>
+              ) : null}
             </div>
           </div>
         </div>

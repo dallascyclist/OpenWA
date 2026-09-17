@@ -99,7 +99,7 @@ export class PluginLoaderService implements OnModuleInit {
       } catch (error) {
         this.logger.error(
           `Failed to load plugin ${entry.name}`,
-          error instanceof Error ? error.message : String(error),
+          error instanceof Error ? (error.stack ?? error.message) : String(error),
           { pluginPath, action: 'plugin_load_failed' },
         );
       }
@@ -340,7 +340,7 @@ export class PluginLoaderService implements OnModuleInit {
       error: (message, error, meta) =>
         this.logger.error(
           `[${plugin.manifest.id}] ${message}`,
-          error instanceof Error ? error.message : String(error),
+          error instanceof Error ? (error.stack ?? error.message) : String(error),
           { ...meta, pluginId: plugin.manifest.id },
         ),
     };

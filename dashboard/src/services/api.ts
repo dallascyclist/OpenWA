@@ -557,6 +557,22 @@ export const settingsApi = {
 // Plugin Types
 // =============================================================================
 
+/** Field definition within a plugin's config schema (mirrors the backend PluginConfigSchema). */
+export interface PluginConfigField {
+  type: 'string' | 'number' | 'boolean' | 'array' | 'object';
+  title?: string;
+  description?: string;
+  default?: unknown;
+  enum?: unknown[];
+  required?: boolean;
+  secret?: boolean;
+}
+
+export interface PluginConfigSchema {
+  type: 'object';
+  properties: Record<string, PluginConfigField>;
+}
+
 export interface Plugin {
   id: string;
   name: string;
@@ -568,6 +584,8 @@ export interface Plugin {
   config: Record<string, unknown>;
   builtIn: boolean;
   provides: string[];
+  /** Declared config fields, when the plugin exposes a schema (drives the dashboard config form). */
+  configSchema?: PluginConfigSchema;
   loadedAt?: string;
   enabledAt?: string;
   error?: string;

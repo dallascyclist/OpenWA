@@ -436,6 +436,18 @@
   box-shadow: 0 0 0 3px rgba(37, 211, 102, 0.1);
 }
 
+.config-form .form-group small {
+  display: block;
+  margin-top: 0.4rem;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.config-form .form-group .required-mark {
+  color: var(--danger, #e5484d);
+}
+
 .toggle-group {
   display: flex;
   align-items: center;

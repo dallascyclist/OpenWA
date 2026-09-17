@@ -33,6 +33,10 @@ export interface GroupState {
   participants: ParticipantMap;
   delegatedControllers: string[];
   announced: boolean;
+  /** Per-group privacy override; undefined => instance default (`CoordinatorOptions.defaultPrivacy`). */
+  privacy?: PrivacyMode;
+  /** One-time cloud disclosure already posted in this group. */
+  privacyDisclosed?: boolean;
 }
 
 export interface InboundMessage {
@@ -56,7 +60,11 @@ export type CommandName =
   | 'ignore'
   | 'unignore'
   | 'grant'
-  | 'revoke';
+  | 'revoke'
+  | 'privacy'
+  | 'model';
+
+export type ModelAction = 'show' | 'list' | 'switch';
 
 export type CommandTarget = { kind: 'me' } | { kind: 'mention' } | { kind: 'number'; number: string };
 
@@ -64,6 +72,9 @@ export interface ParsedCommand {
   name: CommandName;
   lang?: string; // setlang only
   target?: CommandTarget; // setlang/auto/ignore/unignore/grant/revoke
+  privacy?: PrivacyMode; // privacy only; undefined => show current
+  modelAction?: ModelAction; // model only
+  modelId?: string; // model switch only
 }
 
 export interface Translator {
@@ -92,4 +103,90 @@ export interface TranslationLogger {
   debug(message: string, meta?: Record<string, unknown>): void;
   info(message: string, meta?: Record<string, unknown>): void;
   warn(message: string, meta?: Record<string, unknown>): void;
+}
+
+export type PrivacyMode = 'cloud' | 'local';
+
+export interface EffectivePrivacy {
+  mode: PrivacyMode;
+  source: 'group' | 'instance';
+}
+
+/** One prior message, ORIGINAL text only. Never a translation. */
+export interface ContextTurn {
+  author: string; // display name (pushName) or the wid's user part
+  lang: string; // ISO 639-1 known at the time, or 'und'
+  text: string;
+  at: string; // ISO timestamp
+}
+
+export interface TranslateRequest {
+  text: string;
+  senderName: string;
+  candidateLangs: string[]; // group's known languages; may be empty on a group's first message
+  hintLang: string | null; // sender's learned/pinned language
+  glossary: string[]; // participant display names; never translate
+  history: ContextTurn[]; // oldest first; excludes the current message
+  summary?: string; // RESERVED (spec D4); always undefined in this cut
+  allowExternal: boolean; // false => external providers must be skipped
+}
+
+export interface TranslateResult {
+  detected: string; // raw detection; feeds participant learning
+  /**
+   * The language the provider actually translated FROM — equivalently, the one `candidateLangs`
+   * entry that `translations` deliberately omits. That omission is the only guarantee shared by
+   * both implementations; how each arrives at the value differs. `LibreTranslateContextual` applies
+   * the hint-based sanity rule (`candidateLangs.includes(detected) ? detected : hintLang ?? detected`)
+   * to its own detection, whereas the LLM client returns the model's own answer canonicalized to the
+   * group's spelling and no hint fallback, so there `source === detected`. The coordinator therefore
+   * does not trust this field for its own decisions: it re-derives a source from `detected` against
+   * the group's post-learning languages.
+   */
+  source: string;
+  translations: Translation[]; // one per candidateLangs entry !== source (fewer on partial failure)
+  provider: string; // 'llm' | 'libretranslate'
+}
+
+export interface ContextualTranslator {
+  readonly name: string;
+  readonly external: boolean;
+  translateAll(req: TranslateRequest): Promise<TranslateResult>;
+  languages(): Promise<string[]>;
+  isHealthy(): boolean;
+}
+
+/** Reserved (spec D4). Not implemented or wired in this cut. */
+export interface SummaryProvider {
+  summarize(turns: ContextTurn[], previousSummary?: string): Promise<string>;
+}
+
+export interface ModelInfo {
+  id: string;
+  inputPerMTok?: number; // USD per 1M input tokens, when the provider exposes pricing
+  outputPerMTok?: number; // USD per 1M output tokens
+}
+
+/** Implemented by providers whose model can be changed at runtime. */
+export interface ModelSwitchable {
+  listModels(): Promise<ModelInfo[]>;
+  currentModel(): string;
+  setModel(id: string): void;
+}
+
+export interface ModelSelection {
+  model: string;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+export interface ModelStore {
+  load(): Promise<ModelSelection | null>;
+  save(sel: ModelSelection): Promise<void>;
+}
+
+export interface ProviderHealth {
+  name: string;
+  external: boolean;
+  healthy: boolean;
 }

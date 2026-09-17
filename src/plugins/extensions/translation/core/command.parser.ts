@@ -1,5 +1,5 @@
 // src/modules/translation/core/command.parser.ts
-import { ParsedCommand, CommandName, CommandTarget } from './ports';
+import { ParsedCommand, CommandName, CommandTarget, ModelAction } from './ports';
 
 const COMMANDS: ReadonlySet<string> = new Set<CommandName>([
   'help',
@@ -12,6 +12,8 @@ const COMMANDS: ReadonlySet<string> = new Set<CommandName>([
   'unignore',
   'grant',
   'revoke',
+  'privacy',
+  'model',
 ]);
 
 const NEEDS_TARGET: ReadonlySet<string> = new Set(['setlang', 'auto', 'ignore', 'unignore', 'grant', 'revoke']);
@@ -47,6 +49,24 @@ export function parseCommand(body: string, prefix: string): ParsedCommand | null
     const lang = args[0]?.toLowerCase();
     if (!lang) return null;
     return { name, lang, target: parseTarget(args.slice(1)) };
+  }
+
+  if (name === 'privacy') {
+    const mode = args[0]?.toLowerCase();
+    // The guard narrows `mode` to exactly PrivacyMode, so no assertion is needed.
+    return mode === 'cloud' || mode === 'local' ? { name, privacy: mode } : { name };
+  }
+
+  if (name === 'model') {
+    const sub = args[0]?.toLowerCase();
+    if (sub === 'list') return { name, modelAction: 'list' as ModelAction };
+    if (sub === 'switch') {
+      const modelId = args[1]; // case-sensitive: model ids are exact
+      return modelId
+        ? { name, modelAction: 'switch' as ModelAction, modelId }
+        : { name, modelAction: 'switch' as ModelAction };
+    }
+    return { name, modelAction: 'show' as ModelAction };
   }
 
   if (NEEDS_TARGET.has(name)) {
