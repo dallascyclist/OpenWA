@@ -213,6 +213,9 @@ System prompt (intent; exact wording is the implementer's, but every point must 
   slang, profanity, and sexual or adult content **as written**. Never soften, censor, moralize, or refuse.
 - Never add commentary, notes, or explanations.
 - Names listed in `glossary` are people in the chat; copy them verbatim, never translate or transliterate.
+  In practice this holds for Latin-script targets. The model transliterates names into non-Latin target
+  scripts (`Doug` → `Даг` in Russian) and reworded prompts do not stop it; §18 records the owner's decision
+  to accept that, so treat the bullet as a strong instruction rather than a guarantee.
 - `history` is prior conversation for context only; do not translate it and do not include it in output.
 - Determine the language of `text`. If it is one of `candidateLangs`, use that code; otherwise the true
   ISO 639-1 code. `hintLang` is the sender's usual language; prefer it when the text is ambiguous.
@@ -580,20 +583,35 @@ stable run-to-run is the *strength* of profanity at `temperature: 0.2`: identica
 hot" on one run and "so damn hot" on another. Recorded because faithful register is a product requirement
 here, so a drift toward euphemism is a real regression signal, not a cosmetic one. No action proposed.
 
-### Open question (unresolved — the project owner decides, not the implementer)
+### Decision: transliteration of glossary names into non-Latin scripts is accepted
+
+**Resolved by the project owner. Settled — do not reopen without them.**
 
 The live model **transliterates glossary names into non-Latin target scripts** despite the system prompt's
 explicit never-transliterate rule: `Doug` comes back as `Даг` or `Дуг` in Russian. English and Chinese targets
 preserve the Latin spelling correctly. Two live runs against two different prompt wordings failed identically,
-so this is not a one-off sampling artifact and stronger prompt wording has already been tried once.
+so this is not a one-off sampling artifact and stronger prompt wording had already been tried once. That
+evidence is the reason the decision is reasonable: the behaviour is the model localizing a name into the
+target script, it is consistent, and it is not reachable by rewording.
 
-The live smoke script exits 2 on the `keepsNameInEveryTarget` check by design, so the failure stays visible
-until this is decided. Three options are under consideration:
+The owner chose to **accept it**. Transliteration into a non-Latin target script is correct localization, not
+a violation. Three consequences follow, recorded plainly:
 
-1. Accept the behaviour and revert the strengthened prompt bullet, treating transliteration into a
-   non-Latin script as correct localization rather than a violation.
-2. Keep tuning the prompt (e.g. per-target instruction, or restating the glossary inside the user payload).
-3. Post-process deterministically: restore the Latin spelling of every glossary name in the output.
+- The strengthened prompt bullet was reverted to its original short form (see §7). The longer
+  anti-transliteration clause was removed deliberately, as dead weight on every request — it was not lost by
+  accident, and it should not be re-added.
+- **A transliterated name will not match a `pushName`, an `@mention`, or `/tr setlang @Name`.** Anything that
+  resolves a participant by matching the name text against translated output will miss in Russian and other
+  non-Latin-script targets. Resolve participants from the source-side identity, never from translated text.
+- The live smoke script now asserts name preservation only for Latin-script targets
+  (`keepsNameInLatinTargets`); the per-target `nameReport` still prints every language, non-Latin included,
+  so the behaviour stays visible without leaving a permanently red check nobody trusts.
+
+Option 3 — deterministically post-processing the output to restore the Latin spelling of every glossary name
+— was considered and **rejected as risky**: languages that inflect names (Russian among them) decline the
+transliterated form by case, so a naive substitution would either miss the inflected variants or splice an
+uninflected Latin token into a sentence that grammatically requires an ending. The repair would read worse
+than the behaviour it repaired.
 
 ### Operational knowledge has no machine-local home
 

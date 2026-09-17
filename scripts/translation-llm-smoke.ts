@@ -118,7 +118,7 @@ async function main(): Promise<void> {
     zhSourceIsEs: resB.source === 'es',
     zhHasZhHansExactSpelling: resB.translations.some(t => t.lang === 'zh-Hans'),
     zhHasHanText: /[一-鿿]/.test(textFor(resB, 'zh-Hans')),
-    zhKeepsNameInEveryTarget: keepsNameEverywhere(resB, 'Doug'),
+    zhKeepsNameInLatinTargets: keepsNameInLatinTargets(resB, 'Doug'),
   };
   // Probe A's content assertions only hold for the built-in sample. A caller-supplied SMOKE_TEXT
   // need contain neither "Doug" nor anything that translates to English profanity, so asserting
@@ -126,9 +126,10 @@ async function main(): Promise<void> {
   if (process.env.SMOKE_TEXT) {
     console.log('\nSMOKE_TEXT set: skipping the name and profanity checks (they assume the built-in sample).');
   } else {
-    // Checked across EVERY target, not just English: the model preserved "Doug" in English and
-    // Chinese but transliterated it to "Даг"/"Дуг" in Russian, which an English-only check missed.
-    checks.keepsNameInEveryTarget = keepsNameEverywhere(resA, 'Doug');
+    // Asserted only for Latin-script targets. The model transliterates "Doug" to "Даг"/"Дуг" in
+    // Russian; the owner accepted that (spec §18), so it must not turn this check red. The
+    // per-target nameReport above still prints every language, Russian and Chinese included.
+    checks.keepsNameInLatinTargets = keepsNameInLatinTargets(resA, 'Doug');
     checks.keepsProfanity = /fuck|damn|hell|shit|bloody|piss/i.test(enA);
   }
   console.log('\nchecks:', checks);
@@ -146,12 +147,43 @@ function textFor(res: TranslateResult, lang: string): string {
   return res.translations.find(t => t.lang === lang)?.text ?? '';
 }
 
-/** A glossary name must survive verbatim in EVERY target, including non-Latin scripts. */
-function keepsNameEverywhere(res: TranslateResult, name: string): boolean {
-  return res.translations.length > 0 && res.translations.every(t => t.text.includes(name));
+/**
+ * Latin-alphabet targets: the only ones where "did the name survive verbatim?" is a fair question.
+ * Anything not listed is treated as non-Latin, so an unrecognised code is reported but not asserted.
+ */
+const LATIN_SCRIPT_LANGS = new Set([
+  'ca',
+  'da',
+  'de',
+  'en',
+  'es',
+  'fi',
+  'fr',
+  'id',
+  'it',
+  'nl',
+  'pl',
+  'pt',
+  'ro',
+  'sv',
+  'tr',
+  'vi',
+]);
+
+/**
+ * A glossary name must survive verbatim in every LATIN-SCRIPT target. Transliteration into a
+ * non-Latin script ("Doug" -> "Дуг" in Russian) is accepted behaviour — the project owner decided
+ * that, see spec §18 — so those targets are printed by nameReport() but never asserted here.
+ */
+function keepsNameInLatinTargets(res: TranslateResult, name: string): boolean {
+  const latinTargets = res.translations.filter(t => LATIN_SCRIPT_LANGS.has(t.lang));
+  return latinTargets.length > 0 && latinTargets.every(t => t.text.includes(name));
 }
 
-/** Per-target breakdown, so a failure names the language that dropped the glossary term. */
+/**
+ * Per-target breakdown for EVERY target, non-Latin scripts included, so the human running the
+ * smoke test still sees exactly what each language did even where the result is not asserted.
+ */
 function nameReport(res: TranslateResult, name: string): Record<string, boolean> {
   return Object.fromEntries(res.translations.map(t => [t.lang, t.text.includes(name)]));
 }
