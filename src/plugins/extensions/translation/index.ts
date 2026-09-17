@@ -258,6 +258,11 @@ export class TranslationPlugin implements IPlugin {
       context.logger.error('Translation hook failed', error, {
         sessionId: ctx.sessionId,
         action: 'translation_hook_error',
+        // Without these three, a hook failure is unattributable: the VM carried them as an
+        // uncommitted local edit for exactly that reason. Keep them.
+        chatId: msg.chatId,
+        author: msg.author,
+        errorType: error instanceof Error ? error.name : typeof error,
       });
       return { continue: true };
     }
